@@ -1,32 +1,32 @@
 # Default owner for all files
-* @theonlyhennygod @JordanTheJet @chumyin
+* @theonlyhennygod @jordanthejet @chumyin
 
 # Important functional modules
-/src/agent/** @theonlyhennygod @JordanTheJet @chumyin
-/src/providers/** @theonlyhennygod @JordanTheJet @chumyin
-/src/channels/** @theonlyhennygod @JordanTheJet @chumyin
-/src/tools/** @theonlyhennygod @JordanTheJet @chumyin
-/src/gateway/** @theonlyhennygod @JordanTheJet @chumyin
-/src/runtime/** @theonlyhennygod @JordanTheJet @chumyin
-/src/memory/** @theonlyhennygod @JordanTheJet @chumyin
-/Cargo.toml @theonlyhennygod @JordanTheJet @chumyin
-/Cargo.lock @theonlyhennygod @JordanTheJet @chumyin
+/src/agent/** @theonlyhennygod @jordanthejet @chumyin
+/src/providers/** @theonlyhennygod @jordanthejet @chumyin
+/src/channels/** @theonlyhennygod @jordanthejet @chumyin
+/src/tools/** @theonlyhennygod @jordanthejet @chumyin
+/src/gateway/** @theonlyhennygod @jordanthejet @chumyin
+/src/runtime/** @theonlyhennygod @jordanthejet @chumyin
+/src/memory/** @theonlyhennygod @jordanthejet @chumyin
+/Cargo.toml @theonlyhennygod @jordanthejet @chumyin
+/Cargo.lock @theonlyhennygod @jordanthejet @chumyin
 
 # Security / tests / CI-CD ownership
-/src/security/** @theonlyhennygod @JordanTheJet @chumyin
-/tests/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/workflows/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/codeql/** @theonlyhennygod @JordanTheJet @chumyin
-/.github/dependabot.yml @theonlyhennygod @JordanTheJet @chumyin
-/SECURITY.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/actions-source-policy.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/ci-map.md @theonlyhennygod @JordanTheJet @chumyin
+/src/security/** @theonlyhennygod @jordanthejet @chumyin
+/tests/** @theonlyhennygod @jordanthejet @chumyin
+/.github/** @theonlyhennygod @jordanthejet @chumyin
+/.github/workflows/** @theonlyhennygod @jordanthejet @chumyin
+/.github/codeql/** @theonlyhennygod @jordanthejet @chumyin
+/.github/dependabot.yml @theonlyhennygod @jordanthejet @chumyin
+/SECURITY.md @theonlyhennygod @jordanthejet @chumyin
+/docs/actions-source-policy.md @theonlyhennygod @jordanthejet @chumyin
+/docs/ci-map.md @theonlyhennygod @jordanthejet @chumyin
 
 # Docs & governance
-/docs/** @theonlyhennygod @JordanTheJet @chumyin
-/AGENTS.md @theonlyhennygod @JordanTheJet @chumyin
-/CLAUDE.md @theonlyhennygod @JordanTheJet @chumyin
-/CONTRIBUTING.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/pr-workflow.md @theonlyhennygod @JordanTheJet @chumyin
-/docs/reviewer-playbook.md @theonlyhennygod @JordanTheJet @chumyin
+/docs/** @theonlyhennygod @jordanthejet @chumyin
+/AGENTS.md @theonlyhennygod @jordanthejet @chumyin
+/CLAUDE.md @theonlyhennygod @jordanthejet @chumyin
+/CONTRIBUTING.md @theonlyhennygod @jordanthejet @chumyin
+/docs/pr-workflow.md @theonlyhennygod @jordanthejet @chumyin
+/docs/reviewer-playbook.md @theonlyhennygod @jordanthejet @chumyin

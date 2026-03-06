@@ -47,7 +47,7 @@ Publish-mode guardrails:
 
 ## Maintainer Procedure
 
-### 1) Preflight on `main`
+### 1) Preflight on `master`
 
 1. Ensure required checks are green on latest `main`.
 2. Confirm no high-priority incidents or known regressions are open.
@@ -158,7 +158,7 @@ For staged release confidence:
 
 If tag-push release fails after artifacts are validated:
 
-1. Fix workflow or packaging issue on `main`.
+1. Fix workflow or packaging issue on `master`.
 2. Re-run manual `Pub Release` in publish mode with:
    - `publish_release=true`
    - `release_tag=<existing tag>`
