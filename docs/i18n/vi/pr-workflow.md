@@ -99,9 +99,11 @@ Duy trì các quy tắc branch protection sau trên `master`:
 - Yêu cầu check `CI Required Gate`.
 - Yêu cầu review pull request trước khi merge.
 - Yêu cầu review CODEOWNERS cho các đường dẫn được bảo vệ.
-- Với các đường dẫn CI/CD được quản trị (`.github/workflows/**`, `.github/codeql/**`, `.github/connectivity/**`, `.github/release/**`, `.github/security/**`, `.github/actionlint.yaml`, `.github/dependabot.yml`, `scripts/ci/**` và tài liệu CI governance), yêu cầu review phê duyệt tường minh từ `@chumyin` qua `CI Required Gate`.
+- Với `.github/workflows/**`, yêu cầu phê duyệt từ owner qua `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) và giới hạn quyền bypass branch/ruleset cho org owner.
+- Danh sách workflow-owner mặc định bao gồm `theonlyhennygod`, `jordanthejet`, và `chumyin`, và có thể được mở rộng qua biến repository `WORKFLOW_OWNER_LOGINS` (xem CODEOWNERS cho maintainer hiện tại).
 - Hủy bỏ approval cũ khi có commit mới được đẩy lên.
 - Hạn chế force-push trên các branch được bảo vệ.
+- Tất cả PR của contributor nhắm trực tiếp vào `master`.
 
 ---
 
@@ -213,7 +215,7 @@ Chúng tôi **không** yêu cầu contributor định lượng quyền sở hữ
 - Mục tiêu triage maintainer đầu tiên: trong vòng 48 giờ.
 - Nếu PR bị chặn, maintainer để lại một checklist hành động được.
 - Tự động hóa `stale` được dùng để giữ hàng đợi lành mạnh; maintainer có thể áp dụng `no-stale` khi cần.
-- Tự động hóa `pr-hygiene` kiểm tra các PR mở mỗi 12 giờ và đăng nhắc nhở khi PR không có commit mới trong 48+ giờ và hoặc là đang tụt hậu so với `master` hoặc thiếu/thất bại `CI Required Gate` trên head commit.
+- Tự động hóa `pr-hygiene` kiểm tra các PR mở mỗi 12 giờ và đăng nhắc nhở khi PR không có commit mới trong 48+ giờ và rơi vào một trong hai trường hợp: đang tụt hậu so với `master` hoặc thiếu/thất bại `CI Required Gate` trên head commit.
 
 ### 8.1 Kiểm soát ngân sách hàng đợi
 

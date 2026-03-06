@@ -103,7 +103,7 @@ Maintain these branch protection rules on `master`:
 - Require approval after the most recent push.
 - Require CODEOWNERS review for protected paths.
 - For `.github/workflows/**`, require owner approval via `CI Required Gate` (`WORKFLOW_OWNER_LOGINS`) and keep branch/ruleset bypass limited to org owners.
-- Default workflow-owner allowlist includes `theonlyhennygod`, `jordanthejet`, and `chumyin` (plus any comma-separated additions from `WORKFLOW_OWNER_LOGINS`).
+- Default workflow-owner allowlist includes `theonlyhennygod`, `jordanthejet`, and `chumyin`, and can be extended via the `WORKFLOW_OWNER_LOGINS` repository variable.
 - Keep bypass allowances empty by default (use time-boxed break-glass only when absolutely required).
 - Enforce branch protection for admins.
 - Require conversation resolution before merge.
