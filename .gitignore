@@ -41,6 +41,7 @@ otp-secret
 credentials.json
 /config.toml
 .worktrees/
+.zeroclaw/*
 
 # Nix
 result
