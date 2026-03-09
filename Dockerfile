@@ -7,6 +7,10 @@ WORKDIR /app
 ARG ZEROCLAW_CARGO_FEATURES=""
 ARG ZEROCLAW_CARGO_ALL_FEATURES="false"
 
+# Build profile is configurable so local cross-builds on macOS can use
+# `release-fast` while production artifacts keep default `release`.
+ARG CARGO_BUILD_PROFILE=release
+
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
@@ -32,11 +36,11 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ "$ZEROCLAW_CARGO_ALL_FEATURES" = "true" ]; then \
-      cargo build --release --locked --all-features; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked --all-features; \
     elif [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked; \
     fi
 RUN rm -rf src benches crates/robot-kit/src crates/zeroclaw-types/src crates/zeroclaw-core/src
 
@@ -69,13 +73,13 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ "$ZEROCLAW_CARGO_ALL_FEATURES" = "true" ]; then \
-      cargo build --release --locked --all-features; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked --all-features; \
     elif [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
-      cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
-      cargo build --release --locked; \
+      cargo build --profile ${CARGO_BUILD_PROFILE} --locked; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
+    cp target/${CARGO_BUILD_PROFILE}/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
 
 # Prepare runtime directory structure and default config inline (no extra stage)
