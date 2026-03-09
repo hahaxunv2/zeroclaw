@@ -226,6 +226,7 @@ pub struct Config {
     #[serde(default)]
     pub provider: ProviderConfig,
     /// Default model temperature (0.0–2.0). Default: `0.7`.
+    #[serde(default)]
     pub default_temperature: f64,
 
     /// Observability backend configuration (`[observability]`).
