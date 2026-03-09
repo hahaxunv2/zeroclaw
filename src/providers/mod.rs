@@ -1129,7 +1129,6 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         Some(expected)
     }
 }
-}
 
 fn parse_custom_provider_url(
     raw_url: &str,

@@ -2774,7 +2774,36 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
             Ok(response) => {
-                let leak_guard_cfg = gateway_outbound_leak_guard_sna/// POST /qq — incoming QQ Bot webhook (validation + events)
+                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
+                let safe_response = sanitize_gateway_response(
+                    &response,
+                    state.tools_registry_exec.as_ref(),
+                    &leak_guard_cfg,
+                );
+                if let Err(e) = nextcloud_talk
+                    .send(&SendMessage::new(safe_response, &msg.reply_target))
+                    .await
+                {
+                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for Nextcloud Talk webhook message: {e:#}");
+                let _ = nextcloud_talk
+                    .send(&SendMessage::new(
+                        "Sorry, I couldn't process your message right now.",
+                        &msg.reply_target,
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /qq — incoming QQ Bot webhook (validation + events)
 async fn handle_qq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2941,27 +2970,25 @@ async fn handle_admin_paircode(State(state): State<AppState>) -> impl IntoRespon
 }
 /// POST /admin/paircode/new — generate a new pairing code
 async fn handle_admin_paircode_new(State(state): State<AppState>) -> impl IntoResponse {
-    match state.pairing.generate_new_pairing_code() {
-        Some(code) => {
-            tracing::info!("🔐 New pairing code generated via admin endpoint");
-            let body = serde_json::json!({
-                "success": true,
-                "pairing_required": state.pairing.require_pairing(),
-                "pairing_code": code,
-                "message": "New pairing code generated — use this one-time code to pair"
-            });
-            (StatusCode::OK, Json(body))
-        }
-        None => {
-            let body = serde_json::json!({
-                "success": false,
-                "pairing_required": false,
-                "pairing_code": null,
-                "message": "Pairing is disabled for this gateway"
-            });
-            (StatusCode::BAD_REQUEST, Json(body))
-        }
+    if !state.pairing.require_pairing() {
+        let body = serde_json::json!({
+            "success": false,
+            "pairing_required": false,
+            "pairing_code": null,
+            "message": "Pairing is disabled for this gateway"
+        });
+        return (StatusCode::BAD_REQUEST, Json(body));
     }
+
+    let code = state.pairing.generate_new_pairing_code();
+    tracing::info!("🔐 New pairing code generated via admin endpoint");
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": true,
+        "pairing_code": code,
+        "message": "New pairing code generated — use this one-time code to pair"
+    });
+    (StatusCode::OK, Json(body))
 }
 
 #[cfg(test)]

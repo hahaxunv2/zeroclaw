@@ -133,6 +133,14 @@ impl PairingGuard {
         self.pairing_code.lock().clone()
     }
 
+    /// Generate and set a new one-time pairing code.
+    pub fn generate_new_pairing_code(&self) -> String {
+        let mut code = self.pairing_code.lock();
+        let new_code = generate_code();
+        *code = Some(new_code.clone());
+        new_code
+    }
+
     /// Whether pairing is required at all.
     pub fn require_pairing(&self) -> bool {
         self.require_pairing

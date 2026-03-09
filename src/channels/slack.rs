@@ -1,6 +1,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::Context;
 use async_trait::async_trait;
+use base64::Engine as _;
+use chrono::Utc;
+use futures_util::{SinkExt, StreamExt};
+use reqwest::header::HeaderMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -22,6 +27,17 @@ pub struct SlackChannel {
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
+    workspace_dir: Option<PathBuf>,
+}
+
+const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
+const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
+const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
+const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
+const SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS: u64 = 3;
+const SLACK_SOCKET_MODE_MAX_BACKOFF_SECS: u64 = 120;
+const SLACK_SOCKET_MODE_MAX_JITTER_MS: u64 = 500;
+const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
 const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
@@ -57,6 +73,22 @@ impl SlackChannel {
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
+            workspace_dir: None,
+        }
+    }
+
+    /// Configure group-chat trigger policy.
+    pub fn with_group_reply_policy(
+        mut self,
+        mention_only: bool,
+        allowed_sender_ids: Vec<String>,
+    ) -> Self {
+        self.mention_only = mention_only;
+        self.group_reply_allowed_sender_ids =
+            Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
+    }
+
     /// Configure workspace directory used for persisting inbound Slack attachments.
     pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
         self.workspace_dir = Some(dir);
@@ -309,6 +341,27 @@ impl SlackChannel {
             .to_string()
     }
 
+    fn normalize_incoming_text(
+        text: &str,
+        require_mention: bool,
+        bot_user_id: &str,
+    ) -> Option<String> {
+        if require_mention && !Self::contains_bot_mention(text, bot_user_id) {
+            return None;
+        }
+
+        Some(if require_mention {
+            Self::strip_bot_mentions(text, bot_user_id)
+        } else {
+            text.trim().to_string()
+        })
+    }
+
+    fn normalize_incoming_content(
+        text: &str,
+        require_mention: bool,
+        bot_user_id: &str,
+    ) -> Option<String> {
         let normalized = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
         if normalized.is_empty() {
             return None;
@@ -316,6 +369,1204 @@ impl SlackChannel {
         Some(normalized)
     }
 
+    fn is_supported_message_subtype(subtype: Option<&str>) -> bool {
+        matches!(subtype, None | Some("file_share" | "thread_broadcast"))
+    }
+
+    fn compose_incoming_content(text: String, attachment_blocks: Vec<String>) -> Option<String> {
+        let mut sections = Vec::new();
+        if !text.trim().is_empty() {
+            sections.push(text.trim().to_string());
+        }
+        for block in attachment_blocks {
+            if !block.trim().is_empty() {
+                sections.push(block);
+            }
+        }
+
+        if sections.is_empty() {
+            None
+        } else {
+            Some(sections.join("\n\n"))
+        }
+    }
+
+    async fn build_incoming_content(
+        &self,
+        message: &serde_json::Value,
+        require_mention: bool,
+        bot_user_id: &str,
+    ) -> Option<String> {
+        let text = message
+            .get("text")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let normalized_text = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
+        let attachment_blocks = self.render_file_attachments(message).await;
+        Self::compose_incoming_content(normalized_text, attachment_blocks)
+    }
+
+    async fn render_file_attachments(&self, message: &serde_json::Value) -> Vec<String> {
+        let Some(files) = message.get("files").and_then(|value| value.as_array()) else {
+            return Vec::new();
+        };
+
+        if files.len() > SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE {
+            tracing::warn!(
+                "Slack message has {} files; processing first {} only",
+                files.len(),
+                SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE
+            );
+        }
+
+        let limited_files = files
+            .iter()
+            .take(SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let tasks =
+            limited_files
+                .into_iter()
+                .enumerate()
+                .map(|(idx, raw_file)| async move {
+                    (idx, self.render_file_attachment(&raw_file).await)
+                });
+
+        let mut rendered = futures_util::stream::iter(tasks)
+            .buffer_unordered(SLACK_ATTACHMENT_RENDER_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        rendered.sort_by_key(|(idx, _)| *idx);
+        rendered
+            .into_iter()
+            .filter_map(|(_, block)| block)
+            .collect()
+    }
+
+    async fn render_file_attachment(&self, raw_file: &serde_json::Value) -> Option<String> {
+        let file = self
+            .hydrate_file_object(raw_file)
+            .await
+            .unwrap_or_else(|| raw_file.clone());
+
+        if Self::is_image_file(&file) {
+            if let Some(marker) = self.fetch_image_marker(&file).await {
+                return Some(marker);
+            }
+        }
+
+        let mut snippet = Self::file_text_preview(&file);
+        if snippet.is_none() && Self::is_probably_text_file(&file) {
+            snippet = self.download_text_snippet(&file).await;
+        }
+
+        if let Some(text) = snippet {
+            if !text.trim().is_empty() {
+                return Some(Self::format_snippet_attachment(&file, &text));
+            }
+        }
+
+        Some(Self::format_attachment_summary(&file))
+    }
+
+    async fn hydrate_file_object(&self, file: &serde_json::Value) -> Option<serde_json::Value> {
+        let file_id = Self::slack_file_id(file)?;
+        let file_access = file
+            .get("file_access")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let mode = Self::slack_file_mode(file).unwrap_or_default();
+
+        let requires_lookup = file_access.eq_ignore_ascii_case("check_file_info")
+            || Self::slack_file_download_url(file).is_none()
+            || (Self::is_probably_text_file(file) && Self::file_text_preview(file).is_none())
+            || (mode == "snippet" && file.get("preview").is_none());
+        if !requires_lookup {
+            return Some(file.clone());
+        }
+
+        self.fetch_file_info(file_id)
+            .await
+            .or_else(|| Some(file.clone()))
+    }
+
+    async fn fetch_file_info(&self, file_id: &str) -> Option<serde_json::Value> {
+        let resp = match self
+            .http_client()
+            .get("https://slack.com/api/files.info")
+            .bearer_auth(&self.bot_token)
+            .query(&[("file", file_id)])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("Slack files.info request failed for {file_id}: {err}");
+                return None;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!("Slack files.info failed for {file_id} ({status}): {sanitized}");
+            return None;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = payload
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            tracing::warn!("Slack files.info returned error for {file_id}: {err}");
+            return None;
+        }
+
+        payload.get("file").cloned()
+    }
+
+    fn slack_file_id(file: &serde_json::Value) -> Option<&str> {
+        file.get("id").and_then(|value| value.as_str())
+    }
+
+    fn slack_file_name(file: &serde_json::Value) -> String {
+        file.get("title")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| file.get("name").and_then(|value| value.as_str()))
+            .unwrap_or("attachment")
+            .trim()
+            .to_string()
+    }
+
+    fn slack_file_mode(file: &serde_json::Value) -> Option<String> {
+        file.get("mode")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+    }
+
+    fn slack_file_mime(file: &serde_json::Value) -> Option<String> {
+        file.get("mimetype")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+    }
+
+    fn slack_file_download_url(file: &serde_json::Value) -> Option<&str> {
+        file.get("url_private_download")
+            .and_then(|value| value.as_str())
+            .or_else(|| file.get("url_private").and_then(|value| value.as_str()))
+    }
+
+    fn slack_image_candidate_urls(file: &serde_json::Value) -> Vec<String> {
+        let mut urls = Vec::new();
+        let mut seen = HashSet::new();
+        for key in [
+            "thumb_1024",
+            "thumb_960",
+            "thumb_800",
+            "thumb_720",
+            "thumb_480",
+            "thumb_360",
+            "thumb_160",
+            "url_private_download",
+            "url_private",
+        ] {
+            if let Some(url) = file.get(key).and_then(|value| value.as_str()) {
+                let trimmed = url.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if seen.insert(trimmed.to_string()) {
+                    urls.push(trimmed.to_string());
+                }
+            }
+        }
+        urls
+    }
+
+    fn is_allowed_slack_media_hostname(host: &str) -> bool {
+        let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalized.is_empty() {
+            return false;
+        }
+
+        SLACK_ALLOWED_MEDIA_HOST_SUFFIXES
+            .iter()
+            .any(|suffix| normalized == *suffix || normalized.ends_with(&format!(".{suffix}")))
+    }
+
+    fn validate_slack_private_file_url(raw_url: &str) -> Option<reqwest::Url> {
+        let parsed = match reqwest::Url::parse(raw_url) {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!("Slack file URL parse failed for {raw_url}: {err}");
+                return None;
+            }
+        };
+
+        if parsed.scheme() != "https" {
+            tracing::warn!(
+                "Slack file URL rejected due to non-HTTPS scheme for {}: {}",
+                raw_url,
+                parsed.scheme()
+            );
+            return None;
+        }
+
+        let Some(host) = parsed.host_str() else {
+            tracing::warn!("Slack file URL rejected due to missing host: {raw_url}");
+            return None;
+        };
+        if !Self::is_allowed_slack_media_hostname(host) {
+            tracing::warn!("Slack file URL rejected due to non-Slack host: {raw_url}");
+            return None;
+        }
+
+        Some(parsed)
+    }
+
+    fn resolve_https_redirect_target(base: &reqwest::Url, location: &str) -> Option<reqwest::Url> {
+        let target = match base.join(location) {
+            Ok(url) => url,
+            Err(err) => {
+                tracing::warn!(
+                    "Slack file redirect URL parse failed for base {} and location {}: {}",
+                    base,
+                    location,
+                    err
+                );
+                return None;
+            }
+        };
+        if target.scheme() != "https" {
+            tracing::warn!(
+                "Slack file redirect rejected due to non-HTTPS scheme for {}",
+                target
+            );
+            return None;
+        }
+        let Some(host) = target.host_str() else {
+            tracing::warn!(
+                "Slack file redirect rejected due to missing host for {}",
+                target
+            );
+            return None;
+        };
+        if !Self::is_allowed_slack_media_hostname(host) {
+            tracing::warn!(
+                "Slack file redirect rejected due to non-Slack host for {}",
+                target
+            );
+            return None;
+        }
+        Some(target)
+    }
+
+    fn slack_media_http_client_no_redirect(&self) -> reqwest::Client {
+        let builder = crate::config::apply_runtime_proxy_to_builder(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+            "channel.slack",
+        );
+        builder.build().unwrap_or_else(|err| {
+            tracing::warn!(
+                "Failed to build Slack media no-redirect HTTP client, using default client: {err}"
+            );
+            reqwest::Client::new()
+        })
+    }
+
+    async fn fetch_slack_private_file(&self, raw_url: &str) -> Option<reqwest::Response> {
+        let parsed = Self::validate_slack_private_file_url(raw_url)?;
+        let client = self.slack_media_http_client_no_redirect();
+        let initial = match client
+            .get(parsed.clone())
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!("Slack file fetch failed for {}: {}", parsed, err);
+                return None;
+            }
+        };
+
+        if !initial.status().is_redirection() {
+            return Some(initial);
+        }
+
+        let Some(location) = initial.headers().get(reqwest::header::LOCATION) else {
+            return Some(initial);
+        };
+        let Ok(location) = location.to_str() else {
+            tracing::warn!(
+                "Slack file redirect location header is not valid UTF-8 for {}",
+                parsed
+            );
+            return Some(initial);
+        };
+        let Some(redirect_url) = Self::resolve_https_redirect_target(&parsed, location) else {
+            return Some(initial);
+        };
+
+        match self.http_client().get(redirect_url.clone()).send().await {
+            Ok(response) => Some(response),
+            Err(err) => {
+                tracing::warn!(
+                    "Slack redirected file fetch failed for {}: {}",
+                    redirect_url,
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    async fn fetch_image_marker(&self, file: &serde_json::Value) -> Option<String> {
+        let file_name = Self::slack_file_name(file);
+        let image_urls = Self::slack_image_candidate_urls(file);
+        if image_urls.is_empty() {
+            tracing::warn!(
+                "Slack file attachment is image-like but has no downloadable URL: {}",
+                file_name
+            );
+            return None;
+        }
+
+        for url in image_urls {
+            if let Some(marker) = self.download_private_image_as_marker(&url, file).await {
+                return Some(marker);
+            }
+        }
+
+        tracing::warn!("Slack image attachment download failed for {file_name}");
+        None
+    }
+
+    async fn download_private_image_as_marker(
+        &self,
+        url: &str,
+        file: &serde_json::Value,
+    ) -> Option<String> {
+        let resp = self.fetch_slack_private_file(url).await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!("Slack image fetch failed for {url} ({status}): {sanitized}");
+            return None;
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        if let Some(content_length) = resp.content_length() {
+            let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
+            if content_length > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
+                tracing::warn!(
+                    "Slack image fetch skipped for {}: content-length {} exceeds {} bytes",
+                    url,
+                    content_length,
+                    SLACK_ATTACHMENT_IMAGE_MAX_BYTES
+                );
+                return None;
+            }
+        }
+
+        let bytes = match resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("Slack image body read failed for {url}: {err}");
+                return None;
+            }
+        };
+        if bytes.is_empty() {
+            tracing::warn!("Slack image body is empty for {url}");
+            return None;
+        }
+        if bytes.len() > SLACK_ATTACHMENT_IMAGE_MAX_BYTES {
+            tracing::warn!(
+                "Slack image body too large for {}: {} bytes exceeds {} bytes",
+                url,
+                bytes.len(),
+                SLACK_ATTACHMENT_IMAGE_MAX_BYTES
+            );
+            return None;
+        }
+
+        let Some(mime) =
+            Self::detect_image_mime(content_type.as_deref(), file, bytes.as_ref(), url)
+        else {
+            tracing::warn!("Slack image MIME detection failed for {url}");
+            return None;
+        };
+        if !Self::is_supported_image_mime(&mime) {
+            tracing::warn!("Slack image MIME not supported for {url}: {mime}");
+            return None;
+        }
+
+        let file_name = Self::slack_file_name(file);
+        if let Some(saved_path) = self
+            .persist_image_attachment(file, &file_name, &mime, bytes.as_ref())
+            .await
+        {
+            return Some(format!("[IMAGE:{}]", saved_path.display()));
+        }
+
+        if bytes.len() > SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES {
+            tracing::warn!(
+                "Slack image inline fallback skipped for {}: {} bytes exceeds {} bytes",
+                url,
+                bytes.len(),
+                SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES
+            );
+            return None;
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+    }
+
+    fn detect_image_mime(
+        content_type_header: Option<&str>,
+        file: &serde_json::Value,
+        bytes: &[u8],
+        source_url: &str,
+    ) -> Option<String> {
+        if let Some(header_mime) = content_type_header
+            .and_then(Self::normalized_content_type)
+            .filter(|mime| mime.starts_with("image/"))
+        {
+            return Some(header_mime);
+        }
+
+        if let Some(file_mime) =
+            Self::slack_file_mime(file).filter(|mime| mime.starts_with("image/"))
+        {
+            return Some(file_mime);
+        }
+
+        if let Some(ext) = Self::file_extension(source_url)
+            .or_else(|| Self::file_extension(&Self::slack_file_name(file)))
+        {
+            if let Some(mime) = Self::mime_from_extension(&ext) {
+                return Some(mime.to_string());
+            }
+        }
+
+        Self::mime_from_magic(bytes).map(str::to_string)
+    }
+
+    fn normalized_content_type(content_type: &str) -> Option<String> {
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if mime.is_empty() {
+            None
+        } else {
+            Some(mime)
+        }
+    }
+
+    fn is_supported_image_mime(mime: &str) -> bool {
+        SLACK_SUPPORTED_IMAGE_MIME_TYPES.contains(&mime)
+    }
+
+    fn mime_from_extension(ext: &str) -> Option<&'static str> {
+        match ext.to_ascii_lowercase().as_str() {
+            "png" => Some("image/png"),
+            "jpg" | "jpeg" => Some("image/jpeg"),
+            "gif" => Some("image/gif"),
+            "webp" => Some("image/webp"),
+            "bmp" => Some("image/bmp"),
+            _ => None,
+        }
+    }
+
+    fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+        if bytes.len() >= 8
+            && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'])
+        {
+            return Some("image/png");
+        }
+        if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            return Some("image/jpeg");
+        }
+        if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+            return Some("image/gif");
+        }
+        if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            return Some("image/webp");
+        }
+        if bytes.len() >= 2 && bytes.starts_with(b"BM") {
+            return Some("image/bmp");
+        }
+        None
+    }
+
+    async fn persist_image_attachment(
+        &self,
+        file: &serde_json::Value,
+        file_name: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Option<PathBuf> {
+        let workspace = self.workspace_dir.as_ref()?;
+        let safe_name = Self::sanitize_attachment_filename(file_name)
+            .unwrap_or_else(|| "attachment".to_string());
+        let ext = Self::image_extension_for_mime(mime).unwrap_or("png");
+        let safe_name = Self::ensure_file_extension(&safe_name, ext);
+        let file_id = Self::slack_file_id(file)
+            .map(Self::sanitize_file_id)
+            .unwrap_or_else(|| "file".to_string());
+        let generated_name = format!(
+            "slack_{}_{}_{}",
+            Utc::now().timestamp_millis(),
+            file_id,
+            safe_name
+        );
+
+        let output_path = match Self::resolve_workspace_attachment_output_path(
+            workspace,
+            &generated_name,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    "Slack image attachment path resolution failed for {}: {err}",
+                    file_name
+                );
+                return None;
+            }
+        };
+
+        if let Err(err) = tokio::fs::write(&output_path, bytes).await {
+            tracing::warn!(
+                "Slack image attachment write failed for {}: {err}",
+                output_path.display()
+            );
+            return None;
+        }
+
+        Some(output_path)
+    }
+
+    async fn resolve_workspace_attachment_output_path(
+        workspace: &Path,
+        file_name: &str,
+    ) -> anyhow::Result<PathBuf> {
+        let safe_name = Self::sanitize_attachment_filename(file_name)
+            .ok_or_else(|| anyhow::anyhow!("invalid attachment filename: {file_name}"))?;
+
+        tokio::fs::create_dir_all(workspace).await?;
+        let workspace_root = tokio::fs::canonicalize(workspace)
+            .await
+            .unwrap_or_else(|_| workspace.to_path_buf());
+
+        let save_dir = workspace.join(SLACK_ATTACHMENT_SAVE_SUBDIR);
+        tokio::fs::create_dir_all(&save_dir).await?;
+        let resolved_save_dir = tokio::fs::canonicalize(&save_dir).await.with_context(|| {
+            format!(
+                "failed to resolve Slack attachment save directory: {}",
+                save_dir.display()
+            )
+        })?;
+
+        if !resolved_save_dir.starts_with(&workspace_root) {
+            anyhow::bail!(
+                "Slack attachment save directory escapes workspace: {}",
+                resolved_save_dir.display()
+            );
+        }
+
+        let output_path = resolved_save_dir.join(safe_name);
+        match tokio::fs::symlink_metadata(&output_path).await {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "refusing to write Slack attachment through symlink: {}",
+                        output_path.display()
+                    );
+                }
+                if !meta.is_file() {
+                    anyhow::bail!(
+                        "Slack attachment output path is not a regular file: {}",
+                        output_path.display()
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(output_path)
+    }
+
+    fn sanitize_attachment_filename(file_name: &str) -> Option<String> {
+        let basename = Path::new(file_name).file_name()?.to_str()?.trim();
+        if basename.is_empty() || basename == "." || basename == ".." {
+            return None;
+        }
+
+        let sanitized: String = basename
+            .replace(['/', '\\'], "_")
+            .chars()
+            .take(SLACK_ATTACHMENT_FILENAME_MAX_CHARS)
+            .collect();
+        if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+            None
+        } else {
+            Some(sanitized)
+        }
+    }
+
+    fn sanitize_file_id(file_id: &str) -> String {
+        let cleaned: String = file_id
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+            .take(64)
+            .collect();
+        if cleaned.is_empty() {
+            "file".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    fn ensure_file_extension(file_name: &str, extension: &str) -> String {
+        if Path::new(file_name).extension().is_some() {
+            file_name.to_string()
+        } else {
+            format!("{file_name}.{extension}")
+        }
+    }
+
+    fn image_extension_for_mime(mime: &str) -> Option<&'static str> {
+        match mime {
+            "image/png" => Some("png"),
+            "image/jpeg" => Some("jpg"),
+            "image/webp" => Some("webp"),
+            "image/gif" => Some("gif"),
+            "image/bmp" => Some("bmp"),
+            _ => None,
+        }
+    }
+
+    fn file_extension(value: &str) -> Option<String> {
+        let before_query = value.split('?').next().unwrap_or(value);
+        before_query
+            .rsplit('/')
+            .next()
+            .unwrap_or(before_query)
+            .rsplit_once('.')
+            .map(|(_, ext)| ext.to_ascii_lowercase())
+    }
+
+    fn file_text_preview(file: &serde_json::Value) -> Option<String> {
+        let preview = file
+            .get("preview")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                file.get("preview_highlight")
+                    .and_then(|value| value.as_str())
+            })
+            .or_else(|| {
+                file.get("initial_comment")
+                    .and_then(|comment| comment.get("comment"))
+                    .and_then(|value| value.as_str())
+            })?;
+        Self::truncate_text(preview, SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS)
+    }
+
+    fn truncate_text(value: &str, max_chars: usize) -> Option<String> {
+        let mut out = String::new();
+        let mut count = 0usize;
+        for ch in value.chars() {
+            if count >= max_chars {
+                break;
+            }
+            out.push(ch);
+            count += 1;
+        }
+        let mut out = out.trim().to_string();
+        if out.is_empty() {
+            return None;
+        }
+        if value.chars().count() > count {
+            out.push_str("\n…[truncated]");
+        }
+        Some(out)
+    }
+
+    fn is_probably_text_file(file: &serde_json::Value) -> bool {
+        if matches!(
+            Self::slack_file_mode(file).as_deref(),
+            Some("snippet" | "post")
+        ) {
+            return true;
+        }
+
+        if Self::slack_file_mime(file)
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("text/"))
+        {
+            return true;
+        }
+
+        if file
+            .get("filetype")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+            .is_some_and(Self::is_text_filetype)
+        {
+            return true;
+        }
+
+        Self::file_extension(&Self::slack_file_name(file))
+            .as_deref()
+            .is_some_and(Self::is_text_filetype)
+    }
+
+    fn is_text_filetype(filetype: &str) -> bool {
+        matches!(
+            filetype,
+            "txt"
+                | "text"
+                | "md"
+                | "markdown"
+                | "csv"
+                | "tsv"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "xml"
+                | "html"
+                | "css"
+                | "js"
+                | "ts"
+                | "jsx"
+                | "tsx"
+                | "py"
+                | "rs"
+                | "go"
+                | "java"
+                | "kt"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "cs"
+                | "php"
+                | "rb"
+                | "swift"
+                | "sql"
+                | "log"
+                | "ini"
+                | "conf"
+                | "cfg"
+                | "env"
+                | "sh"
+                | "bash"
+                | "zsh"
+        )
+    }
+
+    fn is_image_file(file: &serde_json::Value) -> bool {
+        if Self::slack_file_mime(file)
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            return true;
+        }
+
+        if file
+            .get("filetype")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+            .is_some_and(|filetype| Self::mime_from_extension(filetype).is_some())
+        {
+            return true;
+        }
+
+        Self::file_extension(&Self::slack_file_name(file))
+            .as_deref()
+            .is_some_and(|ext| Self::mime_from_extension(ext).is_some())
+    }
+
+    async fn download_text_snippet(&self, file: &serde_json::Value) -> Option<String> {
+        let url = Self::slack_file_download_url(file)?;
+        let resp = self.fetch_slack_private_file(url).await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!("Slack snippet fetch failed for {url} ({status}): {sanitized}");
+            return None;
+        }
+
+        if let Some(content_length) = resp.content_length() {
+            let content_length = usize::try_from(content_length).unwrap_or(usize::MAX);
+            if content_length > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
+                tracing::warn!(
+                    "Slack snippet download skipped for {}: content-length {} exceeds {} bytes",
+                    url,
+                    content_length,
+                    SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
+                );
+                return None;
+            }
+        }
+
+        let bytes = match resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("Slack snippet body read failed for {url}: {err}");
+                return None;
+            }
+        };
+        if bytes.is_empty() {
+            return None;
+        }
+        if bytes.len() > SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES {
+            tracing::warn!(
+                "Slack snippet body too large for {}: {} bytes exceeds {} bytes",
+                url,
+                bytes.len(),
+                SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES
+            );
+            return None;
+        }
+        if bytes.contains(&0) {
+            tracing::warn!("Slack snippet body appears binary for {url}");
+            return None;
+        }
+
+        let text = String::from_utf8_lossy(&bytes);
+        Self::truncate_text(&text, SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS)
+    }
+
+    fn format_snippet_attachment(file: &serde_json::Value, snippet: &str) -> String {
+        let file_name = Self::slack_file_name(file);
+        let language = file
+            .get("filetype")
+            .and_then(|value| value.as_str())
+            .map(Self::sanitize_code_fence_language)
+            .unwrap_or_else(|| "text".to_string());
+
+        let fence = if snippet.contains("```") {
+            "````"
+        } else {
+            "```"
+        };
+        format!("[SNIPPET:{file_name}]\n{fence}{language}\n{snippet}\n{fence}")
+    }
+
+    fn sanitize_code_fence_language(input: &str) -> String {
+        let normalized = input
+            .trim()
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+'))
+            .collect::<String>();
+        if normalized.is_empty() {
+            "text".to_string()
+        } else {
+            normalized
+        }
+    }
+
+    fn format_attachment_summary(file: &serde_json::Value) -> String {
+        let file_name = Self::slack_file_name(file);
+        let mime = Self::slack_file_mime(file).unwrap_or_else(|| "unknown".to_string());
+        let size = file
+            .get("size")
+            .and_then(|value| value.as_u64())
+            .map(|value| format!("{value} bytes"))
+            .unwrap_or_else(|| "unknown size".to_string());
+        format!("[ATTACHMENT:{file_name} | mime={mime} | size={size}]")
+    }
+
+    fn extract_channel_ids(list_payload: &serde_json::Value) -> Vec<String> {
+        let mut ids = list_payload
+            .get("channels")
+            .and_then(|c| c.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|channel| {
+                let id = channel.get("id").and_then(|id| id.as_str())?;
+                let is_archived = channel
+                    .get("is_archived")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let is_member = channel
+                    .get("is_member")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if is_archived || !is_member {
+                    return None;
+                }
+                Some(id.to_string())
+            })
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
+    async fn list_accessible_channels(&self) -> anyhow::Result<Vec<String>> {
+        let mut channels = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut query_params = vec![
+                ("exclude_archived", "true".to_string()),
+                ("limit", "200".to_string()),
+                (
+                    "types",
+                    "public_channel,private_channel,mpim,im".to_string(),
+                ),
+            ];
+            if let Some(ref next) = cursor {
+                query_params.push(("cursor", next.clone()));
+            }
+
+            let resp = self
+                .http_client()
+                .get("https://slack.com/api/conversations.list")
+                .bearer_auth(&self.bot_token)
+                .query(&query_params)
+                .send()
+                .await?;
+
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+            if !status.is_success() {
+                let sanitized = crate::providers::sanitize_api_error(&body);
+                anyhow::bail!("Slack conversations.list failed ({status}): {sanitized}");
+            }
+
+            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
+                let err = data
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("unknown");
+                anyhow::bail!("Slack conversations.list failed: {err}");
+            }
+
+            channels.extend(Self::extract_channel_ids(&data));
+
+            cursor = data
+                .get("response_metadata")
+                .and_then(|rm| rm.get("next_cursor"))
+                .and_then(|c| c.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(ToOwned::to_owned);
+
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        channels.sort();
+        channels.dedup();
+        Ok(channels)
+    }
+
+    fn slack_now_ts() -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}.{:06}", now.as_secs(), now.subsec_micros())
+    }
+
+    fn ensure_poll_cursor(
+        cursors: &mut HashMap<String, String>,
+        channel_id: &str,
+        now_ts: &str,
+    ) -> String {
+        cursors
+            .entry(channel_id.to_string())
+            .or_insert_with(|| now_ts.to_string())
+            .clone()
+    }
+
+    async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
+        let app_token = self
+            .configured_app_token()
+            .ok_or_else(|| anyhow::anyhow!("Slack Socket Mode requires app_token"))?;
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/apps.connections.open")
+            .bearer_auth(app_token)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            anyhow::bail!("Slack apps.connections.open failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack apps.connections.open failed: {err}");
+        }
+
+        parsed
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open did not return url"))
+    }
+
+    async fn listen_socket_mode(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        bot_user_id: &str,
+        scoped_channels: Option<Vec<String>>,
+    ) -> anyhow::Result<()> {
+        let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
+        let mut open_url_attempt: u32 = 0;
+        let mut socket_reconnect_attempt: u32 = 0;
+
+        loop {
+            let ws_url = match self.open_socket_mode_url().await {
+                Ok(url) => {
+                    open_url_attempt = 0;
+                    url
+                }
+                Err(e) => {
+                    let wait = Self::compute_socket_mode_retry_delay(open_url_attempt);
+                    tracing::warn!(
+                        "Slack Socket Mode: failed to open websocket URL: {e}; retrying in {:.3}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        open_url_attempt.saturating_add(1),
+                    );
+                    open_url_attempt = open_url_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+
+            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+                Ok(connection) => {
+                    socket_reconnect_attempt = 0;
+                    connection
+                }
+                Err(e) => {
+                    let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
+                    tracing::warn!(
+                        "Slack Socket Mode: websocket connect failed: {e}; retrying in {:.3}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        socket_reconnect_attempt.saturating_add(1),
+                    );
+                    socket_reconnect_attempt = socket_reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+            tracing::info!("Slack Socket Mode: websocket connected");
+
+            let (mut write, mut read) = ws_stream.split();
+
+            while let Some(frame) = read.next().await {
+                let text = match frame {
+                    Ok(WsMessage::Text(text)) => text,
+                    Ok(WsMessage::Ping(payload)) => {
+                        if let Err(e) = write.send(WsMessage::Pong(payload)).await {
+                            tracing::warn!("Slack Socket Mode: pong send failed: {e}");
+                            break;
+                        }
+                        continue;
+                    }
+                    Ok(WsMessage::Close(_)) => {
+                        tracing::warn!("Slack Socket Mode: websocket closed by server");
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: websocket read failed: {e}");
+                        break;
+                    }
+                };
+
+                let envelope: serde_json::Value = match serde_json::from_str(text.as_ref()) {
+                    Ok(value) => value,
+                    Err(e) => {
+                        tracing::warn!("Slack Socket Mode: invalid JSON payload: {e}");
+                        continue;
+                    }
+                };
+
+                if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
+                    let ack = serde_json::json!({ "envelope_id": envelope_id });
+                    if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
+                        tracing::warn!("Slack Socket Mode: ack send failed: {e}");
+                        break;
+                    }
+                }
+
+                let envelope_type = envelope
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if envelope_type == "disconnect" {
+                    tracing::warn!("Slack Socket Mode: received disconnect event");
+                    break;
+                }
+                if envelope_type != "events_api" {
+                    continue;
+                }
+
+                let Some(event) = envelope
+                    .get("payload")
+                    .and_then(|payload| payload.get("event"))
+                else {
+                    continue;
+                };
+                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
+                    continue;
+                }
                 let subtype = event.get("subtype").and_then(|v| v.as_str());
                 if !Self::is_supported_message_subtype(subtype) {
                     continue;
@@ -347,7 +1598,6 @@ impl SlackChannel {
                     continue;
                 }
 
->>>>>>> 526d63fd (feat: add slack file reading capability to zeroclaw)
                 let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
                 if ts.is_empty() {
                     continue;
@@ -366,10 +1616,6 @@ impl SlackChannel {
                 let require_mention =
                     self.mention_only && is_group_message && !allow_sender_without_mention;
 
-<<<<<<< HEAD
-                let Some(normalized_text) =
-                    Self::normalize_incoming_content(text, require_mention, bot_user_id)
-=======
                 let Some(normalized_text) = self
                     .build_incoming_content(event, require_mention, bot_user_id)
                     .await
@@ -398,8 +1644,14 @@ impl SlackChannel {
                 }
             }
 
-            tracing::warn!("Slack Socket Mode: reconnecting in 3 seconds...");
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            let wait = Self::compute_socket_mode_retry_delay(socket_reconnect_attempt);
+            tracing::warn!(
+                "Slack Socket Mode: reconnecting in {:.3}s (attempt #{})...",
+                wait.as_secs_f64(),
+                socket_reconnect_attempt.saturating_add(1),
+            );
+            socket_reconnect_attempt = socket_reconnect_attempt.saturating_add(1);
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -439,12 +1691,36 @@ impl SlackChannel {
         nanos % (max_jitter_ms + 1)
     }
 
-    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+    fn compute_exponential_backoff_delay(
+        base_retry_after_secs: u64,
+        attempt: u32,
+        max_backoff_secs: u64,
+        jitter_ms: u64,
+    ) -> Duration {
         let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
         let backoff_secs = base_retry_after_secs
             .saturating_mul(multiplier)
-            .min(SLACK_HISTORY_MAX_BACKOFF_SECS);
+            .min(max_backoff_secs);
         Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms)
+    }
+
+    fn compute_retry_delay(base_retry_after_secs: u64, attempt: u32, jitter_ms: u64) -> Duration {
+        Self::compute_exponential_backoff_delay(
+            base_retry_after_secs,
+            attempt,
+            SLACK_HISTORY_MAX_BACKOFF_SECS,
+            jitter_ms,
+        )
+    }
+
+    fn compute_socket_mode_retry_delay(attempt: u32) -> Duration {
+        let jitter_ms = Self::jitter_ms_from_clock(SLACK_SOCKET_MODE_MAX_JITTER_MS);
+        Self::compute_exponential_backoff_delay(
+            SLACK_SOCKET_MODE_INITIAL_BACKOFF_SECS,
+            attempt,
+            SLACK_SOCKET_MODE_MAX_BACKOFF_SECS,
+            jitter_ms,
+        )
     }
 
     fn next_retry_timestamp(wait: Duration) -> String {
@@ -787,6 +2063,213 @@ mod tests {
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
         assert!(!ch.mention_only);
         assert!(ch.group_reply_allowed_sender_ids.is_empty());
+    }
+
+    #[test]
+    fn with_workspace_dir_sets_field() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![])
+            .with_workspace_dir(PathBuf::from("/tmp/slack-workspace"));
+        assert_eq!(
+            ch.workspace_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/slack-workspace"))
+        );
+    }
+
+    #[test]
+    fn slack_group_reply_policy_applies_sender_overrides() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
+            .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
+
+        assert!(ch.mention_only);
+        assert_eq!(
+            ch.group_reply_allowed_sender_ids,
+            vec!["U111".to_string(), "U222".to_string()]
+        );
+        assert!(ch.is_group_sender_trigger_enabled("U111"));
+        assert!(!ch.is_group_sender_trigger_enabled("U999"));
+    }
+
+    #[test]
+    fn normalized_channel_id_respects_wildcard_and_blank() {
+        assert_eq!(SlackChannel::normalized_channel_id(None), None);
+        assert_eq!(SlackChannel::normalized_channel_id(Some("")), None);
+        assert_eq!(SlackChannel::normalized_channel_id(Some("   ")), None);
+        assert_eq!(SlackChannel::normalized_channel_id(Some("*")), None);
+        assert_eq!(SlackChannel::normalized_channel_id(Some(" * ")), None);
+        assert_eq!(
+            SlackChannel::normalized_channel_id(Some(" C12345 ")),
+            Some("C12345".to_string())
+        );
+    }
+
+    #[test]
+    fn configured_app_token_ignores_blank_values() {
+        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![], vec![]);
+        assert_eq!(ch.configured_app_token(), None);
+    }
+
+    #[test]
+    fn configured_app_token_trims_value() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            Some(" xapp-123 ".into()),
+            None,
+            vec![],
+            vec![],
+        );
+        assert_eq!(ch.configured_app_token().as_deref(), Some("xapp-123"));
+    }
+
+    #[test]
+    fn scoped_channel_ids_prefers_explicit_list() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec!["C_LIST1".into(), "D_DM1".into()],
+            vec![],
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_LIST1".to_string(), "D_DM1".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_falls_back_to_single_channel_id() {
+        let ch = SlackChannel::new(
+            "xoxb-fake".into(),
+            None,
+            Some("C_SINGLE".into()),
+            vec![],
+            vec![],
+        );
+        assert_eq!(ch.scoped_channel_ids(), Some(vec!["C_SINGLE".to_string()]));
+    }
+
+    #[test]
+    fn scoped_channel_ids_returns_none_for_wildcard_mode() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert_eq!(ch.scoped_channel_ids(), None);
+    }
+
+    #[test]
+    fn is_group_channel_id_detects_channel_prefixes() {
+        assert!(SlackChannel::is_group_channel_id("C123"));
+        assert!(SlackChannel::is_group_channel_id("G123"));
+        assert!(!SlackChannel::is_group_channel_id("D123"));
+        assert!(!SlackChannel::is_group_channel_id(""));
+    }
+
+    #[test]
+    fn extract_channel_ids_filters_archived_and_non_member_entries() {
+        let payload = serde_json::json!({
+            "channels": [
+                {"id": "C1", "is_archived": false, "is_member": true},
+                {"id": "C2", "is_archived": true, "is_member": true},
+                {"id": "C3", "is_archived": false, "is_member": false},
+                {"id": "C1", "is_archived": false, "is_member": true},
+                {"id": "C4"}
+            ]
+        });
+        let ids = SlackChannel::extract_channel_ids(&payload);
+        assert_eq!(ids, vec!["C1".to_string(), "C4".to_string()]);
+    }
+
+    #[test]
+    fn empty_allowlist_denies_everyone() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        assert!(!ch.is_user_allowed("U12345"));
+        assert!(!ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn wildcard_allows_everyone() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        assert!(ch.is_user_allowed("U12345"));
+    }
+
+    #[test]
+    fn extract_user_display_name_prefers_profile_display_name() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "Display Name",
+                    "real_name": "Real Name"
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("Display Name")
+        );
+    }
+
+    #[test]
+    fn extract_user_display_name_falls_back_to_username() {
+        let payload = serde_json::json!({
+            "ok": true,
+            "user": {
+                "name": "fallback_name",
+                "profile": {
+                    "display_name": "   ",
+                    "real_name": ""
+                }
+            }
+        });
+
+        assert_eq!(
+            SlackChannel::extract_user_display_name(&payload).as_deref(),
+            Some("fallback_name")
+        );
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_none_when_expired() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        {
+            let mut cache = ch.user_display_name_cache.lock().unwrap();
+            cache.insert(
+                "U123".to_string(),
+                CachedSlackDisplayName {
+                    display_name: "Expired Name".to_string(),
+                    expires_at: Instant::now() - Duration::from_secs(1),
+                },
+            );
+        }
+
+        assert_eq!(ch.cached_sender_display_name("U123"), None);
+    }
+
+    #[test]
+    fn cached_sender_display_name_returns_cached_value_when_valid() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
+        ch.cache_sender_display_name("U123", "Cached Name");
+
+        assert_eq!(
+            ch.cached_sender_display_name("U123").as_deref(),
+            Some("Cached Name")
+        );
+    }
+
+    #[test]
+    fn normalize_incoming_content_requires_mention_when_enabled() {
+        assert!(SlackChannel::normalize_incoming_content("hello", true, "U_BOT").is_none());
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, "U_BOT").as_deref(),
+            Some("run")
+        );
+    }
+
+    #[test]
+    fn normalize_incoming_content_without_mention_mode_keeps_message() {
+        assert_eq!(
+            SlackChannel::normalize_incoming_content("  hello world  ", false, "U_BOT").as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
