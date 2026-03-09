@@ -40,6 +40,7 @@ pub mod slack;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
+pub mod tts;
 pub mod wati;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -71,6 +72,8 @@ pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use traits::{Channel, SendMessage};
+#[allow(unused_imports)]
+pub use tts::{TtsManager, TtsProvider};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -1446,6 +1449,29 @@ async fn load_runtime_defaults_from_config_file(
             &mut parsed.transcription.api_key,
             "config.transcription.api_key",
         )?;
+
+        // Decrypt TTS provider API keys for runtime reload
+        if let Some(ref mut openai) = parsed.tts.openai {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut openai.api_key,
+                "config.tts.openai.api_key",
+            )?;
+        }
+        if let Some(ref mut elevenlabs) = parsed.tts.elevenlabs {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut elevenlabs.api_key,
+                "config.tts.elevenlabs.api_key",
+            )?;
+        }
+        if let Some(ref mut google) = parsed.tts.google {
+            decrypt_optional_secret_for_runtime_reload(
+                &store,
+                &mut google.api_key,
+                "config.tts.google.api_key",
+            )?;
+        }
     }
 
     parsed.apply_env_overrides();
