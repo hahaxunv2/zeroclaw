@@ -6581,7 +6581,7 @@ impl Default for Config {
             default_model: Some(DEFAULT_MODEL_NAME.to_string()),
             model_providers: HashMap::new(),
             provider: ProviderConfig::default(),
-            default_temperature: 0.7,
+            default_temperature: default_temperature(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             security: SecurityConfig::default(),
