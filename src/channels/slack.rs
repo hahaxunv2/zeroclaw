@@ -1,9 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use anyhow::Context;
 use async_trait::async_trait;
-use chrono::Utc;
-use futures_util::{SinkExt, StreamExt};
-use reqwest::header::HeaderMap;
-use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -24,13 +22,23 @@ pub struct SlackChannel {
     mention_only: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
-}
-
-const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
-const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
-const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
-const SLACK_HISTORY_MAX_JITTER_MS: u64 = 500;
-const SLACK_USER_CACHE_TTL_SECS: u64 = 6 * 60 * 60;
+const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
+const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
+const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
+const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
+const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
+const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
+const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
+const SLACK_ALLOWED_MEDIA_HOST_SUFFIXES: &[&str] =
+    &["slack.com", "slack-edge.com", "slack-files.com"];
+const SLACK_SUPPORTED_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+];
 
 impl SlackChannel {
     pub fn new(
@@ -49,18 +57,9 @@ impl SlackChannel {
             mention_only: false,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Configure group-chat trigger policy.
-    pub fn with_group_reply_policy(
-        mut self,
-        mention_only: bool,
-        allowed_sender_ids: Vec<String>,
-    ) -> Self {
-        self.mention_only = mention_only;
-        self.group_reply_allowed_sender_ids =
-            Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+    /// Configure workspace directory used for persisting inbound Slack attachments.
+    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
         self
     }
 
@@ -310,270 +309,15 @@ impl SlackChannel {
             .to_string()
     }
 
-    fn normalize_incoming_content(
-        text: &str,
-        require_mention: bool,
-        bot_user_id: &str,
-    ) -> Option<String> {
-        if text.trim().is_empty() {
-            return None;
-        }
-        if require_mention && !Self::contains_bot_mention(text, bot_user_id) {
-            return None;
-        }
-
-        let normalized = if require_mention {
-            Self::strip_bot_mentions(text, bot_user_id)
-        } else {
-            text.trim().to_string()
-        };
-
+        let normalized = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
         if normalized.is_empty() {
             return None;
         }
         Some(normalized)
     }
 
-    fn extract_channel_ids(list_payload: &serde_json::Value) -> Vec<String> {
-        let mut ids = list_payload
-            .get("channels")
-            .and_then(|c| c.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|channel| {
-                let id = channel.get("id").and_then(|id| id.as_str())?;
-                let is_archived = channel
-                    .get("is_archived")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let is_member = channel
-                    .get("is_member")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                if is_archived || !is_member {
-                    return None;
-                }
-                Some(id.to_string())
-            })
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        ids
-    }
-
-    async fn list_accessible_channels(&self) -> anyhow::Result<Vec<String>> {
-        let mut channels = Vec::new();
-        let mut cursor: Option<String> = None;
-
-        loop {
-            let mut query_params = vec![
-                ("exclude_archived", "true".to_string()),
-                ("limit", "200".to_string()),
-                (
-                    "types",
-                    "public_channel,private_channel,mpim,im".to_string(),
-                ),
-            ];
-            if let Some(ref next) = cursor {
-                query_params.push(("cursor", next.clone()));
-            }
-
-            let resp = self
-                .http_client()
-                .get("https://slack.com/api/conversations.list")
-                .bearer_auth(&self.bot_token)
-                .query(&query_params)
-                .send()
-                .await?;
-
-            let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-            if !status.is_success() {
-                let sanitized = crate::providers::sanitize_api_error(&body);
-                anyhow::bail!("Slack conversations.list failed ({status}): {sanitized}");
-            }
-
-            let data: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            if data.get("ok") == Some(&serde_json::Value::Bool(false)) {
-                let err = data
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown");
-                anyhow::bail!("Slack conversations.list failed: {err}");
-            }
-
-            channels.extend(Self::extract_channel_ids(&data));
-
-            cursor = data
-                .get("response_metadata")
-                .and_then(|rm| rm.get("next_cursor"))
-                .and_then(|c| c.as_str())
-                .map(str::trim)
-                .filter(|c| !c.is_empty())
-                .map(ToOwned::to_owned);
-
-            if cursor.is_none() {
-                break;
-            }
-        }
-
-        channels.sort();
-        channels.dedup();
-        Ok(channels)
-    }
-
-    fn slack_now_ts() -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        format!("{}.{:06}", now.as_secs(), now.subsec_micros())
-    }
-
-    fn ensure_poll_cursor(
-        cursors: &mut HashMap<String, String>,
-        channel_id: &str,
-        now_ts: &str,
-    ) -> String {
-        cursors
-            .entry(channel_id.to_string())
-            .or_insert_with(|| now_ts.to_string())
-            .clone()
-    }
-
-    async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
-        let app_token = self
-            .configured_app_token()
-            .ok_or_else(|| anyhow::anyhow!("Slack Socket Mode requires app_token"))?;
-
-        let resp = self
-            .http_client()
-            .post("https://slack.com/api/apps.connections.open")
-            .bearer_auth(app_token)
-            .send()
-            .await?;
-
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-
-        if !status.is_success() {
-            let sanitized = crate::providers::sanitize_api_error(&body);
-            anyhow::bail!("Slack apps.connections.open failed ({status}): {sanitized}");
-        }
-
-        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
-            let err = parsed
-                .get("error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("unknown");
-            anyhow::bail!("Slack apps.connections.open failed: {err}");
-        }
-
-        parsed
-            .get("url")
-            .and_then(|v| v.as_str())
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("Slack apps.connections.open did not return url"))
-    }
-
-    async fn listen_socket_mode(
-        &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        bot_user_id: &str,
-        scoped_channels: Option<Vec<String>>,
-    ) -> anyhow::Result<()> {
-        let mut last_ts_by_channel: HashMap<String, String> = HashMap::new();
-
-        loop {
-            let ws_url = match self.open_socket_mode_url().await {
-                Ok(url) => url,
-                Err(e) => {
-                    tracing::warn!("Slack Socket Mode: failed to open websocket URL: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
-
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
-                Ok(connection) => connection,
-                Err(e) => {
-                    tracing::warn!("Slack Socket Mode: websocket connect failed: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    continue;
-                }
-            };
-            tracing::info!("Slack Socket Mode: websocket connected");
-
-            let (mut write, mut read) = ws_stream.split();
-
-            while let Some(frame) = read.next().await {
-                let text = match frame {
-                    Ok(WsMessage::Text(text)) => text,
-                    Ok(WsMessage::Ping(payload)) => {
-                        if let Err(e) = write.send(WsMessage::Pong(payload)).await {
-                            tracing::warn!("Slack Socket Mode: pong send failed: {e}");
-                            break;
-                        }
-                        continue;
-                    }
-                    Ok(WsMessage::Close(_)) => {
-                        tracing::warn!("Slack Socket Mode: websocket closed by server");
-                        break;
-                    }
-                    Ok(_) => continue,
-                    Err(e) => {
-                        tracing::warn!("Slack Socket Mode: websocket read failed: {e}");
-                        break;
-                    }
-                };
-
-                let envelope: serde_json::Value = match serde_json::from_str(text.as_ref()) {
-                    Ok(value) => value,
-                    Err(e) => {
-                        tracing::warn!("Slack Socket Mode: invalid JSON payload: {e}");
-                        continue;
-                    }
-                };
-
-                if let Some(envelope_id) = envelope.get("envelope_id").and_then(|v| v.as_str()) {
-                    let ack = serde_json::json!({ "envelope_id": envelope_id });
-                    if let Err(e) = write.send(WsMessage::Text(ack.to_string().into())).await {
-                        tracing::warn!("Slack Socket Mode: ack send failed: {e}");
-                        break;
-                    }
-                }
-
-                let envelope_type = envelope
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if envelope_type == "disconnect" {
-                    tracing::warn!("Slack Socket Mode: received disconnect event");
-                    break;
-                }
-                if envelope_type != "events_api" {
-                    continue;
-                }
-
-                let Some(event) = envelope
-                    .get("payload")
-                    .and_then(|payload| payload.get("event"))
-                else {
-                    continue;
-                };
-                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
-                    continue;
-                }
-                // Skip non-user message subtypes (e.g. channel_join/message_changed)
-                // to avoid invalid thread replies.
-                if event.get("subtype").is_some() {
+                let subtype = event.get("subtype").and_then(|v| v.as_str());
+                if !Self::is_supported_message_subtype(subtype) {
                     continue;
                 }
 
@@ -603,14 +347,7 @@ impl SlackChannel {
                     continue;
                 }
 
-                let text = event
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if text.is_empty() {
-                    continue;
-                }
-
+>>>>>>> 526d63fd (feat: add slack file reading capability to zeroclaw)
                 let ts = event.get("ts").and_then(|v| v.as_str()).unwrap_or_default();
                 if ts.is_empty() {
                     continue;
@@ -629,8 +366,13 @@ impl SlackChannel {
                 let require_mention =
                     self.mention_only && is_group_message && !allow_sender_without_mention;
 
+<<<<<<< HEAD
                 let Some(normalized_text) =
                     Self::normalize_incoming_content(text, require_mention, bot_user_id)
+=======
+                let Some(normalized_text) = self
+                    .build_incoming_content(event, require_mention, bot_user_id)
+                    .await
                 else {
                     continue;
                 };
@@ -939,9 +681,8 @@ impl Channel for SlackChannel {
                 if let Some(messages) = data.get("messages").and_then(|m| m.as_array()) {
                     // Messages come newest-first, reverse to process oldest first
                     for msg in messages.iter().rev() {
-                        // Skip non-user message subtypes (e.g. channel_join/message_changed)
-                        // to avoid invalid thread replies.
-                        if msg.get("subtype").is_some() {
+                        let subtype = msg.get("subtype").and_then(|value| value.as_str());
+                        if !Self::is_supported_message_subtype(subtype) {
                             continue;
                         }
                         let ts = msg.get("ts").and_then(|t| t.as_str()).unwrap_or("");
@@ -949,7 +690,6 @@ impl Channel for SlackChannel {
                             .get("user")
                             .and_then(|u| u.as_str())
                             .unwrap_or("unknown");
-                        let text = msg.get("text").and_then(|t| t.as_str()).unwrap_or("");
                         let last_ts = last_ts_by_channel
                             .get(&channel_id)
                             .map(String::as_str)
@@ -968,8 +708,7 @@ impl Channel for SlackChannel {
                             continue;
                         }
 
-                        // Skip empty or already-seen
-                        if text.is_empty() || ts <= last_ts {
+                        if ts <= last_ts {
                             continue;
                         }
 
@@ -978,8 +717,9 @@ impl Channel for SlackChannel {
                             is_group_message && self.is_group_sender_trigger_enabled(user);
                         let require_mention =
                             self.mention_only && is_group_message && !allow_sender_without_mention;
-                        let Some(normalized_text) =
-                            Self::normalize_incoming_content(text, require_mention, &bot_user_id)
+                        let Some(normalized_text) = self
+                            .build_incoming_content(msg, require_mention, &bot_user_id)
+                            .await
                         else {
                             continue;
                         };
@@ -1050,200 +790,148 @@ mod tests {
     }
 
     #[test]
-    fn slack_group_reply_policy_applies_sender_overrides() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()])
-            .with_group_reply_policy(true, vec![" U111 ".into(), "U111".into(), "U222".into()]);
-
-        assert!(ch.mention_only);
-        assert_eq!(
-            ch.group_reply_allowed_sender_ids,
-            vec!["U111".to_string(), "U222".to_string()]
-        );
-        assert!(ch.is_group_sender_trigger_enabled("U111"));
-        assert!(!ch.is_group_sender_trigger_enabled("U999"));
-    }
-
-    #[test]
-    fn normalized_channel_id_respects_wildcard_and_blank() {
-        assert_eq!(SlackChannel::normalized_channel_id(None), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("   ")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some("*")), None);
-        assert_eq!(SlackChannel::normalized_channel_id(Some(" * ")), None);
-        assert_eq!(
-            SlackChannel::normalized_channel_id(Some(" C12345 ")),
-            Some("C12345".to_string())
-        );
-    }
-
-    #[test]
-    fn configured_app_token_ignores_blank_values() {
-        let ch = SlackChannel::new("xoxb-fake".into(), Some("   ".into()), None, vec![], vec![]);
-        assert_eq!(ch.configured_app_token(), None);
-    }
-
-    #[test]
-    fn configured_app_token_trims_value() {
-        let ch = SlackChannel::new(
-            "xoxb-fake".into(),
-            Some(" xapp-123 ".into()),
-            None,
-            vec![],
-            vec![],
-        );
-        assert_eq!(ch.configured_app_token().as_deref(), Some("xapp-123"));
-    }
-
-    #[test]
-    fn scoped_channel_ids_prefers_explicit_list() {
-        let ch = SlackChannel::new(
-            "xoxb-fake".into(),
-            None,
-            Some("C_SINGLE".into()),
-            vec!["C_LIST1".into(), "D_DM1".into()],
-            vec![],
+    fn compose_incoming_content_allows_attachment_only_messages() {
+        let composed = SlackChannel::compose_incoming_content(
+            "".to_string(),
+            vec!["[IMAGE:data:image/png;base64,aaaa]".to_string()],
         );
         assert_eq!(
-            ch.scoped_channel_ids(),
-            Some(vec!["C_LIST1".to_string(), "D_DM1".to_string()])
+            composed.as_deref(),
+            Some("[IMAGE:data:image/png;base64,aaaa]")
         );
     }
 
     #[test]
-    fn scoped_channel_ids_falls_back_to_single_channel_id() {
-        let ch = SlackChannel::new(
-            "xoxb-fake".into(),
-            None,
-            Some("C_SINGLE".into()),
-            vec![],
-            vec![],
-        );
-        assert_eq!(ch.scoped_channel_ids(), Some(vec!["C_SINGLE".to_string()]));
+    fn message_subtype_support_allows_file_share() {
+        assert!(SlackChannel::is_supported_message_subtype(None));
+        assert!(SlackChannel::is_supported_message_subtype(Some(
+            "file_share"
+        )));
+        assert!(SlackChannel::is_supported_message_subtype(Some(
+            "thread_broadcast"
+        )));
+        assert!(!SlackChannel::is_supported_message_subtype(Some(
+            "message_changed"
+        )));
+        assert!(!SlackChannel::is_supported_message_subtype(Some(
+            "channel_join"
+        )));
     }
 
     #[test]
-    fn scoped_channel_ids_returns_none_for_wildcard_mode() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
-        assert_eq!(ch.scoped_channel_ids(), None);
-    }
-
-    #[test]
-    fn is_group_channel_id_detects_channel_prefixes() {
-        assert!(SlackChannel::is_group_channel_id("C123"));
-        assert!(SlackChannel::is_group_channel_id("G123"));
-        assert!(!SlackChannel::is_group_channel_id("D123"));
-        assert!(!SlackChannel::is_group_channel_id(""));
-    }
-
-    #[test]
-    fn extract_channel_ids_filters_archived_and_non_member_entries() {
-        let payload = serde_json::json!({
-            "channels": [
-                {"id": "C1", "is_archived": false, "is_member": true},
-                {"id": "C2", "is_archived": true, "is_member": true},
-                {"id": "C3", "is_archived": false, "is_member": false},
-                {"id": "C1", "is_archived": false, "is_member": true},
-                {"id": "C4"}
-            ]
+    fn file_text_preview_prefers_preview_field() {
+        let file = serde_json::json!({
+            "preview": "line 1\nline 2",
+            "preview_highlight": "ignored"
         });
-        let ids = SlackChannel::extract_channel_ids(&payload);
-        assert_eq!(ids, vec!["C1".to_string(), "C4".to_string()]);
-    }
-
-    #[test]
-    fn empty_allowlist_denies_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
-        assert!(!ch.is_user_allowed("U12345"));
-        assert!(!ch.is_user_allowed("anyone"));
-    }
-
-    #[test]
-    fn wildcard_allows_everyone() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
-        assert!(ch.is_user_allowed("U12345"));
-    }
-
-    #[test]
-    fn extract_user_display_name_prefers_profile_display_name() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "user": {
-                "name": "fallback_name",
-                "profile": {
-                    "display_name": "Display Name",
-                    "real_name": "Real Name"
-                }
-            }
-        });
-
         assert_eq!(
-            SlackChannel::extract_user_display_name(&payload).as_deref(),
-            Some("Display Name")
+            SlackChannel::file_text_preview(&file).as_deref(),
+            Some("line 1\nline 2")
         );
     }
 
     #[test]
-    fn extract_user_display_name_falls_back_to_username() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "user": {
-                "name": "fallback_name",
-                "profile": {
-                    "display_name": "   ",
-                    "real_name": ""
-                }
-            }
-        });
+    fn is_image_file_detects_mimetype_or_extension() {
+        let from_mime = serde_json::json!({"mimetype":"image/png"});
+        let from_ext = serde_json::json!({"name":"photo.jpeg"});
+        let non_image = serde_json::json!({"name":"notes.txt","mimetype":"text/plain"});
+        assert!(SlackChannel::is_image_file(&from_mime));
+        assert!(SlackChannel::is_image_file(&from_ext));
+        assert!(!SlackChannel::is_image_file(&non_image));
+    }
 
+    #[test]
+    fn is_probably_text_file_accepts_snippet_mode() {
+        let snippet = serde_json::json!({"mode":"snippet"});
+        let plain = serde_json::json!({"mimetype":"text/plain"});
+        let binary = serde_json::json!({"mimetype":"application/octet-stream","name":"a.bin"});
+        assert!(SlackChannel::is_probably_text_file(&snippet));
+        assert!(SlackChannel::is_probably_text_file(&plain));
+        assert!(!SlackChannel::is_probably_text_file(&binary));
+    }
+
+    #[test]
+    fn sanitize_attachment_filename_strips_path_traversal() {
         assert_eq!(
-            SlackChannel::extract_user_display_name(&payload).as_deref(),
-            Some("fallback_name")
+            SlackChannel::sanitize_attachment_filename("../../secret.txt").as_deref(),
+            Some("secret.txt")
+        );
+        assert_eq!(
+            SlackChannel::sanitize_attachment_filename(r"..\\..\\secret.txt").as_deref(),
+            Some("..__..__secret.txt")
+        );
+        assert!(SlackChannel::sanitize_attachment_filename("..").is_none());
+    }
+
+    #[test]
+    fn ensure_file_extension_appends_when_missing() {
+        assert_eq!(
+            SlackChannel::ensure_file_extension("capture", "png"),
+            "capture.png"
+        );
+        assert_eq!(
+            SlackChannel::ensure_file_extension("capture.jpeg", "png"),
+            "capture.jpeg"
         );
     }
 
     #[test]
-    fn cached_sender_display_name_returns_none_when_expired() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
-        {
-            let mut cache = ch.user_display_name_cache.lock().unwrap();
-            cache.insert(
-                "U123".to_string(),
-                CachedSlackDisplayName {
-                    display_name: "Expired Name".to_string(),
-                    expires_at: Instant::now() - Duration::from_secs(1),
-                },
-            );
-        }
-
-        assert_eq!(ch.cached_sender_display_name("U123"), None);
+    fn is_allowed_slack_media_hostname_matches_suffixes() {
+        assert!(SlackChannel::is_allowed_slack_media_hostname(
+            "files.slack.com"
+        ));
+        assert!(SlackChannel::is_allowed_slack_media_hostname(
+            "downloads.slack-edge.com"
+        ));
+        assert!(SlackChannel::is_allowed_slack_media_hostname(
+            "foo.slack-files.com"
+        ));
+        assert!(!SlackChannel::is_allowed_slack_media_hostname(
+            "example.com"
+        ));
     }
 
     #[test]
-    fn cached_sender_display_name_returns_cached_value_when_valid() {
-        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec!["*".into()]);
-        ch.cache_sender_display_name("U123", "Cached Name");
-
-        assert_eq!(
-            ch.cached_sender_display_name("U123").as_deref(),
-            Some("Cached Name")
+    fn validate_slack_private_file_url_rejects_invalid_schemes_and_hosts() {
+        assert!(
+            SlackChannel::validate_slack_private_file_url("https://files.slack.com/f").is_some()
         );
+        assert!(
+            SlackChannel::validate_slack_private_file_url("http://files.slack.com/f").is_none()
+        );
+        assert!(SlackChannel::validate_slack_private_file_url("https://example.com/f").is_none());
+        assert!(SlackChannel::validate_slack_private_file_url("not a url").is_none());
     }
 
     #[test]
-    fn normalize_incoming_content_requires_mention_when_enabled() {
-        assert!(SlackChannel::normalize_incoming_content("hello", true, "U_BOT").is_none());
+    fn resolve_https_redirect_target_enforces_https() {
+        let base = reqwest::Url::parse("https://files.slack.com/path/file").unwrap();
+        let ok = SlackChannel::resolve_https_redirect_target(&base, "/next");
         assert_eq!(
-            SlackChannel::normalize_incoming_content("<@U_BOT> run", true, "U_BOT").as_deref(),
-            Some("run")
+            ok.as_ref().map(|url| url.as_str()),
+            Some("https://files.slack.com/next")
         );
+
+        let rejected =
+            SlackChannel::resolve_https_redirect_target(&base, "http://files.slack.com/next");
+        assert!(rejected.is_none());
+
+        let rejected_host =
+            SlackChannel::resolve_https_redirect_target(&base, "https://example.com/next");
+        assert!(rejected_host.is_none());
     }
 
-    #[test]
-    fn normalize_incoming_content_without_mention_mode_keeps_message() {
-        assert_eq!(
-            SlackChannel::normalize_incoming_content("  hello world  ", false, "U_BOT").as_deref(),
-            Some("hello world")
-        );
+    #[tokio::test]
+    async fn resolve_workspace_attachment_output_path_stays_in_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let output =
+            SlackChannel::resolve_workspace_attachment_output_path(workspace.path(), "capture.png")
+                .await
+                .unwrap();
+
+        let root = tokio::fs::canonicalize(workspace.path()).await.unwrap();
+        assert!(output.starts_with(&root));
+        assert!(output.to_string_lossy().contains("slack_files"));
     }
 
     #[test]
