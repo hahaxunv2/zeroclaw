@@ -307,8 +307,8 @@ Examples:
         model: Option<String>,
 
         /// Temperature (0.0 - 2.0)
-        #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
-        temperature: f64,
+        #[arg(short, long, value_parser = parse_temperature)]
+        temperature: Option<f64>,
 
         /// Attach a peripheral (board:path, e.g. nucleo-f401re:/dev/ttyACM0)
         #[arg(long)]
@@ -1125,22 +1125,24 @@ async fn main() -> Result<()> {
             // Single-shot mode (-m) runs non-interactively: no TTY approval prompt,
             // so tools are not denied by a stdin read returning EOF.
             let interactive = message.is_none();
-            Box::pin(agent::run(
+            let final_temperature = temperature.unwrap_or(config.default_temperature);
+
+            agent::run(
                 config,
                 message,
                 provider,
                 model,
-                temperature,
+                final_temperature,
                 peripheral,
                 interactive,
                 None,
-            ))
+            )
             .await
             .map(|_| ())
         }
+        }
 
         Commands::Gateway {
-            port,
             host,
             new_pairing,
             open_dashboard,
@@ -2950,6 +2952,32 @@ mod tests {
                 assert!(instructions);
             }
             other => panic!("expected update command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_command_parses_with_temperature() {
+        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--temperature", "0.5"])
+            .expect("agent command with temperature should parse");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(temperature, Some(0.5));
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_command_parses_without_temperature() {
+        let cli = Cli::try_parse_from(["zeroclaw", "agent", "--message", "hello"])
+            .expect("agent command without temperature should parse");
+
+        match cli.command {
+            Commands::Agent { temperature, .. } => {
+                assert_eq!(temperature, None);
+            }
+            other => panic!("expected agent command, got {other:?}"),
         }
     }
 }
