@@ -434,8 +434,20 @@ fn is_token_hash(value: &str) -> bool {
 
 /// Constant-time string comparison to prevent timing attacks.
 ///
-/// Does not short-circuit on length mismatch — always iterates over the
-/// longer input to avoid leaking length information via timing.
+/// This function is critical to the security of the pairing mechanism:
+/// when verifying the one-time pairing code, timing side-channels could
+/// allow an attacker to deduce the correct code character-by-character.
+///
+/// Implementation details that ensure constant-time execution:
+/// 1. Does not short-circuit on length mismatch — always iterates over
+///    the longer input to avoid leaking length information via timing.
+/// 2. Uses bitwise AND (&) instead of logical AND (&&) to ensure both
+///    comparisons always execute, preventing timing variations that could
+///    reveal whether the length check or byte comparison failed first.
+///
+/// SECURITY NOTE: The use of `&` instead of `&&` is intentional and
+/// required for constant-time behavior. Do not change to `&&` or clippy
+/// suggestions that would reintroduce short-circuit evaluation.
 #[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
