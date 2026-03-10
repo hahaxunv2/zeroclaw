@@ -45,5 +45,8 @@ credentials.json
 
 # Nix
 result
+
+# Skill eval workspaces (test outputs, transcripts, grading)
+.claude/skills/*-workspace/
 # Coverage artifacts
 lcov.info
