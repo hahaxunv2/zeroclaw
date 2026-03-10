@@ -2173,7 +2173,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'*' {
                     if let Some(end) = line[i + 2..].find("**") {
                         let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                        write!(line_out, "<b>{inner}</b>").unwrap();
+                        let _ = write!(line_out, "<b>{inner}</b>");
                         i += 4 + end;
                         continue;
                     }
@@ -2181,7 +2181,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 if i + 1 < len && bytes[i] == b'_' && bytes[i + 1] == b'_' {
                     if let Some(end) = line[i + 2..].find("__") {
                         let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                        write!(line_out, "<b>{inner}</b>").unwrap();
+                        let _ = write!(line_out, "<b>{inner}</b>");
                         i += 4 + end;
                         continue;
                     }
@@ -2191,7 +2191,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     if let Some(end) = line[i + 1..].find('*') {
                         if end > 0 {
                             let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                            write!(line_out, "<i>{inner}</i>").unwrap();
+                            let _ = write!(line_out, "<i>{inner}</i>");
                             i += 2 + end;
                             continue;
                         }
@@ -2201,7 +2201,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 if bytes[i] == b'`' && (i == 0 || bytes[i - 1] != b'`') {
                     if let Some(end) = line[i + 1..].find('`') {
                         let inner = Self::escape_html(&line[i + 1..i + 1 + end]);
-                        write!(line_out, "<code>{inner}</code>").unwrap();
+                        let _ = write!(line_out, "<code>{inner}</code>");
                         i += 2 + end;
                         continue;
                     }
@@ -2217,8 +2217,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                                 if url.starts_with("http://") || url.starts_with("https://") {
                                     let text_html = Self::escape_html(text_part);
                                     let url_html = Self::escape_html(url);
-                                    write!(line_out, "<a href=\"{url_html}\">{text_html}</a>")
-                                        .unwrap();
+                                    let _ =
+                                        write!(line_out, "<a href=\"{url_html}\">{text_html}</a>");
                                     i = after_bracket + 1 + paren_end + 1;
                                     continue;
                                 }
@@ -2230,7 +2230,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
                     if let Some(end) = line[i + 2..].find("~~") {
                         let inner = Self::escape_html(&line[i + 2..i + 2 + end]);
-                        write!(line_out, "<s>{inner}</s>").unwrap();
+                        let _ = write!(line_out, "<s>{inner}</s>");
                         i += 4 + end;
                         continue;
                     }
@@ -2263,7 +2263,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     in_code_block = false;
                     let escaped = code_buf.trim_end_matches('\n');
                     // Telegram HTML parse mode supports <pre> and <code>, but not class attributes.
-                    writeln!(final_out, "<pre><code>{escaped}</code></pre>").unwrap();
+                    let _ = writeln!(final_out, "<pre><code>{escaped}</code></pre>");
                     code_buf.clear();
                 } else {
                     in_code_block = true;
@@ -2278,7 +2278,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
         if in_code_block && !code_buf.is_empty() {
-            writeln!(final_out, "<pre><code>{}</code></pre>", code_buf.trim_end()).unwrap();
+            let _ = writeln!(final_out, "<pre><code>{}</code></pre>", code_buf.trim_end());
         }
 
         final_out.trim_end_matches('\n').to_string()
@@ -5390,10 +5390,10 @@ mod tests {
 
     #[test]
     fn telegram_split_many_short_lines() {
-        let msg: String = (0..1_000)
-            .map(|i| format!("line {i}\n"))
-            .collect::<Vec<_>>()
-            .concat();
+        let msg: String = (0..1000).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let parts = split_message_for_telegram(&msg);
         for part in &parts {
             assert!(
@@ -5746,7 +5746,7 @@ mod tests {
     /// Skipped automatically when `GROQ_API_KEY` is not set.
     /// Run: `GROQ_API_KEY=<key> cargo test --lib -- telegram::tests::e2e_live_voice_transcription_and_reply_cache --ignored`
     #[tokio::test]
-    #[ignore = "requires GROQ_API_KEY"]
+    #[ignore = "requires GROQ_API_KEY environment variable"]
     async fn e2e_live_voice_transcription_and_reply_cache() {
         if std::env::var("GROQ_API_KEY").is_err() {
             eprintln!("GROQ_API_KEY not set — skipping live voice transcription test");

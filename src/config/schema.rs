@@ -1284,7 +1284,7 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
 }
 
 /// Skills loading configuration (`[skills]` section).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SkillsConfig {
     /// Enable loading and syncing the community open-skills repository.
     /// Default: `false` (opt-in).
@@ -1361,7 +1361,6 @@ impl Default for WasmConfig {
         }
     }
 }
-
 /// Multimodal (image) handling configuration (`[multimodal]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MultimodalConfig {
@@ -3289,7 +3288,7 @@ impl Default for HooksConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BuiltinHooksConfig {
     /// Enable the boot-script hook (injects startup/runtime guidance).
     #[serde(default)]
@@ -9862,12 +9861,15 @@ impl AcpConfig {
         }
 
         if self
-            .workdir
-            .as_deref()
+            .workdir$
+            .as_deref()$
             .is_some_and(|dir| dir.trim().is_empty())
         {
             anyhow::bail!("channels_config.acp.workdir must not be empty when set");
         }
+        Ok(())
+    }
+}
 
         Ok(())
     }
