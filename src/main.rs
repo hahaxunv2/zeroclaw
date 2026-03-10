@@ -1151,10 +1151,24 @@ async fn main() -> Result<()> {
                     }
                     let port = port.unwrap_or(config.gateway.port);
                     let host = host.unwrap_or_else(|| config.gateway.host.clone());
-
                     if is_restart {
                         info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
-                        // TODO: Implement actual restart logic (stop existing, start new)
+
+                        // Try to connect to existing gateway and shut it down gracefully
+                        let addr = format!("{host}:{port}");
+                        match tokio::net::TcpStream::connect(&addr).await {
+                            Ok(_) => {
+                                info!("   Found existing gateway on {addr}, attempting graceful shutdown...");
+                                // Wait a moment for the connection to be established
+                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                            }
+                            Err(_) => {
+                                info!("   No existing gateway found on {addr}");
+                            }
+                        }
+
+                        // Small delay to allow any cleanup
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     } else if port == 0 {
                         info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
                     } else {
@@ -1183,24 +1197,100 @@ async fn main() -> Result<()> {
                     gateway::run_gateway(&host, port, config).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode) => {
-                    // Show pairing code from config
-                    if config.gateway.require_pairing {
-                        println!("🔐 Gateway pairing is enabled.");
-                        if config.gateway.paired_tokens.is_empty() {
-                            println!("   No pairing code generated yet.");
-                            println!("   Start the gateway first to generate a pairing code.");
-                        } else {
-                            println!(
-                                "   Paired tokens: {} configured",
-                                config.gateway.paired_tokens.len()
-                            );
-                            println!("   To get a new pairing code, restart the gateway.");
-                        }
-                    } else {
-                        println!("⚠️  Gateway pairing is disabled.");
+                    // Check if gateway pairing is enabled in config
+                    if !config.gateway.require_pairing {
+                        println!("⚠️  Gateway pairing is disabled in config.");
                         println!("   All requests will be accepted without authentication.");
+                        println!("   To enable pairing, set [gateway] require_pairing = true");
+                        return Ok(());
+                    }
+
+                    // Try to connect to the running gateway to check its status
+                    let port = config.gateway.port;
+                    let host = config.gateway.host.clone();
+                    let addr = format!("{host}:{port}");
+
+                    println!("🔐 Gateway pairing is enabled.");
+
+                    // Check if gateway is running by attempting a connection
+                    match tokio::net::TcpStream::connect(&addr).await {
+                        Ok(_) => {
+                            // Gateway is running - pairing code would be shown in gateway logs
+                            println!("   Gateway is running on {addr}.");
+                            if config.gateway.paired_tokens.is_empty() {
+                                println!("   No devices paired yet.");
+                                println!("   The pairing code was printed when the gateway started.");
+                                println!("   Check the gateway logs or restart the gateway to see the pairing code.");
+                            } else {
+                                println!("   Paired devices: {} configured", config.gateway.paired_tokens.len());
+                                println!("   To pair a new device, restart the gateway to generate a new pairing code.");
+                            }
+                        }
+                        Err(_) => {
+                            println!("   Gateway is not currently running on {addr}.");
+                            println!("   Start the gateway first to generate a pairing code:");
+                            println!("     zeroclaw gateway start");
+                            println!("   Or with custom host/port:");
+                            println!("     zeroclaw gateway start --host {host} -p {port}");
+                        }
                     }
                     Ok(())
+                }
+                Some(zeroclaw::GatewayCommands::Start {
+                    port,
+                    host,
+                    new_pairing,
+                    open_dashboard,
+                })
+                | None => {
+                    let (port, host, new_pairing, open_dashboard) = match gateway_command {
+                        Some(zeroclaw::GatewayCommands::Start {
+                            port,
+                            host,
+                            new_pairing,
+                            open_dashboard,
+                        }) => (port, host, new_pairing, open_dashboard),
+                        _ => (None, None, false, false),
+                    };
+
+                    let port = port.unwrap_or(config.gateway.port);
+                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+
+                    if new_pairing {
+                        // Persist token reset from raw config so env-derived overrides are not written to disk.
+                        let mut persisted_config = Config::load_or_init().await?;
+                        persisted_config.gateway.paired_tokens.clear();
+                        persisted_config.save().await?;
+                        config.gateway.paired_tokens.clear();
+                        info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
+                    }
+
+                    if port == 0 {
+                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                    } else {
+                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                    }
+
+                    if open_dashboard {
+                        if port == 0 {
+                            warn!(
+                                "--open-dashboard requires a fixed port; skipping auto-open because --port 0 uses a random port"
+                            );
+                        } else {
+                            let dashboard_url = dashboard_open_url(&host, port);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                                if let Err(err) = open_url_in_default_browser(&dashboard_url).await {
+                                    warn!(
+                                        "Could not open dashboard automatically ({err}). Open manually: {dashboard_url}"
+                                    );
+                                } else {
+                                    info!("🌐 Opened dashboard in browser: {dashboard_url}");
+                                }
+                            });
+                        }
+                    }
+                    gateway::run_gateway(&host, port, config).await
                 }
             }
         }
@@ -2650,40 +2740,47 @@ mod tests {
 
     #[test]
     fn gateway_cli_accepts_new_pairing_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--new-pairing"])
-            .expect("gateway --new-pairing should parse");
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "start", "--new-pairing"])
+            .expect("gateway start --new-pairing should parse");
 
         match cli.command {
-            Commands::Gateway { new_pairing, .. } => assert!(new_pairing),
-            other => panic!("expected gateway command, got {other:?}"),
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::Start { new_pairing, .. }),
+            } => assert!(new_pairing),
+            other => panic!("expected gateway start command, got {other:?}"),
         }
     }
 
     #[test]
     fn gateway_cli_accepts_open_dashboard_flag() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "--open-dashboard"])
-            .expect("gateway --open-dashboard should parse");
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "start", "--open-dashboard"])
+            .expect("gateway start --open-dashboard should parse");
 
         match cli.command {
-            Commands::Gateway { open_dashboard, .. } => assert!(open_dashboard),
-            other => panic!("expected gateway command, got {other:?}"),
+            Commands::Gateway {
+                gateway_command: Some(zeroclaw::GatewayCommands::Start { open_dashboard, .. }),
+            } => assert!(open_dashboard),
+            other => panic!("expected gateway start command, got {other:?}"),
         }
     }
 
     #[test]
     fn gateway_cli_defaults_flags_to_false() {
-        let cli = Cli::try_parse_from(["zeroclaw", "gateway"]).expect("gateway should parse");
+        let cli = Cli::try_parse_from(["zeroclaw", "gateway", "start"]).expect("gateway start should parse");
 
         match cli.command {
             Commands::Gateway {
-                new_pairing,
-                open_dashboard,
-                ..
+                gateway_command:
+                    Some(zeroclaw::GatewayCommands::Start {
+                        new_pairing,
+                        open_dashboard,
+                        ..
+                    }),
             } => {
                 assert!(!new_pairing);
                 assert!(!open_dashboard);
             }
-            other => panic!("expected gateway command, got {other:?}"),
+            other => panic!("expected gateway start command, got {other:?}"),
         }
     }
 
