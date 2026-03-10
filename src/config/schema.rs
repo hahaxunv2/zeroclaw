@@ -9861,16 +9861,12 @@ impl AcpConfig {
         }
 
         if self
-            .workdir$
-            .as_deref()$
+            .workdir
+            .as_deref()
             .is_some_and(|dir| dir.trim().is_empty())
         {
             anyhow::bail!("channels_config.acp.workdir must not be empty when set");
         }
-        Ok(())
-    }
-}
-
         Ok(())
     }
 }
