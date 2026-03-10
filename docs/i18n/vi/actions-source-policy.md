@@ -77,7 +77,9 @@ Ghi chú quét gần đây nhất:
 - 2026-02-26: Chuẩn hóa runner/action cho cache Rust và Docker build
     - Đã thêm mẫu allowlist: `Swatinem/rust-cache@*`
     - Docker build dùng `docker/setup-buildx-action` và `docker/build-push-action`
-- 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release.yml`: `sigstore/cosign-installer@...`
+- 2026-02-17: Cache phụ thuộc Rust được migrate từ `Swatinem/rust-cache` sang `useblacksmith/rust-cache`
+    - Không cần mẫu allowlist mới (`useblacksmith/*` đã có trong allowlist)
+- 2026-02-16: Phụ thuộc ẩn được phát hiện trong `release-beta-on-push.yml`: `sigstore/cosign-installer@...`
     - Đã thêm mẫu allowlist: `sigstore/cosign-installer@*`
 - 2026-02-17: Cập nhật cân bằng tính tái tạo/độ tươi của security audit
     - Đã thêm mẫu allowlist: `rustsec/audit-check@*`
