@@ -87,6 +87,7 @@ Last refreshed: **February 28, 2026**.
 - [ci-map.md](contributing/ci-map.md)
 - [actions-source-policy.md](contributing/actions-source-policy.md)
 - [cargo-slicer-speedup.md](contributing/cargo-slicer-speedup.md)
+- [extension-examples.md](contributing/extension-examples.md)
 
 ### 7) SOP Runtime & Procedures
 
