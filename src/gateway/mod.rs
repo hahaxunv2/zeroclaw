@@ -847,6 +847,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Build router with middleware
     let app = Router::new()
+        // ── Admin routes (for CLI management) ──
+        .route("/admin/shutdown", post(handle_admin_shutdown))
+        .route("/admin/paircode", get(handle_admin_paircode))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -2770,35 +2773,7 @@ async fn handle_nextcloud_talk_webhook(
 
         match run_gateway_chat_with_tools(&state, &msg.content, Some(&session_id)).await {
             Ok(response) => {
-                let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
-                let safe_response = sanitize_gateway_response(
-                    &response,
-                    state.tools_registry_exec.as_ref(),
-                    &leak_guard_cfg,
-                );
-                if let Err(e) = nextcloud_talk
-                    .send(&SendMessage::new(safe_response, &msg.reply_target))
-                    .await
-                {
-                    tracing::error!("Failed to send Nextcloud Talk reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for Nextcloud Talk message: {e:#}");
-                let _ = nextcloud_talk
-                    .send(&SendMessage::new(
-                        "Sorry, I couldn't process your message right now.",
-                        &msg.reply_target,
-                    ))
-                    .await;
-            }
-        }
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
-/// POST /qq — incoming QQ Bot webhook (validation + events)
+                let leak_guard_cfg = gateway_outbound_leak_guard_sna/// POST /qq — incoming QQ Bot webhook (validation + events)
 async fn handle_qq_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2903,6 +2878,91 @@ async fn handle_qq_webhook(
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ADMIN HANDLERS (for CLI management)
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Response for admin endpoints
+#[derive(serde::Serialize)]
+struct AdminResponse {
+    success: bool,
+    message: String,
+}
+
+/// POST /admin/shutdown — graceful shutdown from CLI
+async fn handle_admin_shutdown(State(_state): State<AppState>) -> impl IntoResponse {
+    tracing::info!("🔌 Admin shutdown request received — initiating graceful shutdown");
+
+    // Signal shutdown to the system
+    crate::health::mark_component_stopping("gateway");
+
+    // The server will shut down when this response is sent
+    // In a real implementation, we might use a shutdown channel
+    let body = AdminResponse {
+        success: true,
+        message: "Gateway shutdown initiated".to_string(),
+    };
+
+    // Spawn a task to gracefully exit after responding
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+        std::process::exit(0);
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
+/// GET /admin/paircode — fetch current pairing code
+async fn handle_admin_paircode(State(state): State<AppState>) -> impl IntoResponse {
+    let code = state.pairing.pairing_code();
+
+    let body = if let Some(c) = code {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": c,
+            "message": "Use this one-time code to pair"
+        })
+    } else {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": null,
+            "message": if state.pairing.require_pairing() {
+                "Pairing is active but no new code available (already paired or code expired)"
+            } else {
+                "Pairing is disabled for this gateway"
+            }
+        })
+    };
+
+    (StatusCode::OK, Json(body))
+}
+
+    let body = if let Some(c) = code {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": c,
+            "message": "Use this one-time code to pair"
+        })
+    } else {
+        serde_json::json!({
+            "success": true,
+            "pairing_required": state.pairing.require_pairing(),
+            "pairing_code": null,
+            "message": if state.pairing.require_pairing() {
+                "Pairing is active but no new code available (already paired or code expired)"
+            } else {
+                "Pairing is disabled for this gateway"
+            }
+        })
+    };
+
+    (StatusCode::OK, Json(body))
 }
 
 #[cfg(test)]
