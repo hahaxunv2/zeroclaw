@@ -4,10 +4,10 @@
 
 ```bash
 # Full automated test suite (~2 min)
-./test_telegram_integration.sh
+./tests/telegram/test_telegram_integration.sh
 
 # Quick smoke test (~10 sec)
-./quick_test.sh
+./tests/telegram/quick_test.sh
 
 # Just compile and unit test (~30 sec)
 cargo test telegram --lib
@@ -24,7 +24,7 @@ Toolchain note: CI/release metadata is aligned with Rust `1.88`; use the same st
    - **Detailed summary** at the end
 
    ```bash
-   ./test_telegram_integration.sh
+   ./tests/telegram/test_telegram_integration.sh
    ```
 
 ### 2. **quick_test.sh** (Fast Validation)
@@ -33,7 +33,7 @@ Toolchain note: CI/release metadata is aligned with Rust `1.88`; use the same st
    - Perfect for **pre-commit** checks
 
    ```bash
-   ./quick_test.sh
+   ./tests/telegram/quick_test.sh
    ```
 
 ### 3. **generate_test_messages.py** (Test Helper)
@@ -43,10 +43,10 @@ Toolchain note: CI/release metadata is aligned with Rust `1.88`; use the same st
 
    ```bash
    # Generate a long message (>4096 chars)
-   python3 test_helpers/generate_test_messages.py long
+   python3 tests/telegram/generate_test_messages.py long
 
    # Show all message types
-   python3 test_helpers/generate_test_messages.py all
+   python3 tests/telegram/generate_test_messages.py all
    ```
 
 ### 4. **TESTING_TELEGRAM.md** (Complete Guide)
@@ -63,10 +63,10 @@ Toolchain note: CI/release metadata is aligned with Rust `1.88`; use the same st
 cd /Users/abdzsam/zeroclaw
 
 # Make scripts executable (already done)
-chmod +x test_telegram_integration.sh quick_test.sh
+chmod +x tests/telegram/test_telegram_integration.sh tests/telegram/quick_test.sh
 
 # Run the full test suite
-./test_telegram_integration.sh
+./tests/telegram/test_telegram_integration.sh
 ```
 
 **Expected output:**
@@ -148,7 +148,7 @@ zeroclaw channel start
 
 ```bash
 # Generate a long message
-python3 test_helpers/generate_test_messages.py long
+python3 tests/telegram/generate_test_messages.py long
 ```
 
 - **Copy the output**
@@ -163,7 +163,7 @@ python3 test_helpers/generate_test_messages.py long
 #### Test 3: Word Boundary Splitting
 
 ```bash
-python3 test_helpers/generate_test_messages.py word
+python3 tests/telegram/generate_test_messages.py word
 ```
 
 - Send to bot
@@ -259,17 +259,17 @@ Add to your workflow:
 ```bash
 # Pre-commit hook
 #!/bin/bash
-./quick_test.sh
+./tests/telegram/quick_test.sh
 
 # CI pipeline
-./test_telegram_integration.sh
+./tests/telegram/test_telegram_integration.sh
 ```
 
 ## 📚 Next Steps
 
 1. **Run the tests:**
    ```bash
-   ./test_telegram_integration.sh
+   ./tests/telegram/test_telegram_integration.sh
    ```
 
 2. **Fix any failures** using the troubleshooting guide
@@ -301,5 +301,5 @@ If all tests pass:
 ## 📞 Support
 
 - Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
-- Docs: `./TESTING_TELEGRAM.md`
+- Docs: `docs/contributing/testing-telegram.md`
 - Help: `zeroclaw --help`
