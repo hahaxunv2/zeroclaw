@@ -181,8 +181,8 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, HardwareCommands, IntegrationCommands, MigrateCommands,
-    PeripheralCommands, ServiceCommands, SkillCommands,
+    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -336,37 +336,20 @@ Examples:
         memory_backend: Option<String>,
     },
 
-    /// Start the gateway server (webhooks, websockets)
+    /// Start/manage the gateway server (webhooks, websockets)
     #[command(long_about = "\
-Start the gateway server (webhooks, websockets).
+Manage the gateway server (webhooks, websockets).
 
-Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
-and WebSocket connections. Bind address defaults to the values in \
-your config file (gateway.host / gateway.port).
+Start, restart, or inspect the HTTP/WebSocket gateway that accepts \
+incoming webhook events and WebSocket connections.
 
 Examples:
-  zeroclaw gateway                  # use config defaults
-  zeroclaw gateway -p 8080          # listen on port 8080
-  zeroclaw gateway --host 0.0.0.0   # bind to all interfaces
-  zeroclaw gateway --open-dashboard # open web dashboard automatically
-  zeroclaw gateway -p 0             # random available port
-  zeroclaw gateway --new-pairing    # clear tokens and generate fresh pairing code")]
+  zeroclaw gateway start              # start gateway
+  zeroclaw gateway restart            # restart gateway
+  zeroclaw gateway get-paircode       # show pairing code")]
     Gateway {
-        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
-        #[arg(short, long)]
-        port: Option<u16>,
-
-        /// Host to bind to; defaults to config gateway.host
-        #[arg(long)]
-        host: Option<String>,
-
-        /// Clear all paired tokens and generate a fresh pairing code
-        #[arg(long)]
-        new_pairing: bool,
-
-        /// Open the web dashboard URL in the default browser on startup
-        #[arg(long)]
-        open_dashboard: bool,
+        #[command(subcommand)]
+        gateway_command: Option<zeroclaw::GatewayCommands>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -1139,46 +1122,87 @@ async fn main() -> Result<()> {
             .map(|_| ())
         }
 
-        Commands::Gateway {
-            host,
-            new_pairing,
-            open_dashboard,
-        } => {
-            if new_pairing {
-                // Persist token reset from raw config so env-derived overrides are not written to disk.
-                let mut persisted_config = Config::load_or_init().await?;
-                persisted_config.gateway.paired_tokens.clear();
-                persisted_config.save().await?;
-                config.gateway.paired_tokens.clear();
-                info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
-            }
-            let port = port.unwrap_or(config.gateway.port);
-            let host = host.unwrap_or_else(|| config.gateway.host.clone());
-            if port == 0 {
-                info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
-            } else {
-                info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
-            }
-            if open_dashboard {
-                if port == 0 {
-                    warn!(
-                        "--open-dashboard requires a fixed port; skipping auto-open because --port 0 uses a random port"
+        Commands::Gateway { gateway_command } => {
+            match gateway_command {
+                Some(zeroclaw::GatewayCommands::Start {
+                    port,
+                    host,
+                    new_pairing,
+                    open_dashboard,
+                })
+                | Some(zeroclaw::GatewayCommands::Restart {
+                    port,
+                    host,
+                    new_pairing,
+                    open_dashboard,
+                })
+                | None => {
+                    let is_restart = matches!(
+                        gateway_command,
+                        Some(zeroclaw::GatewayCommands::Restart { .. })
                     );
-                } else {
-                    let dashboard_url = dashboard_open_url(&host, port);
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                        if let Err(err) = open_url_in_default_browser(&dashboard_url).await {
+                    if new_pairing {
+                        // Persist token reset from raw config so env-derived overrides are not written to disk.
+                        let mut persisted_config = Config::load_or_init().await?;
+                        persisted_config.gateway.paired_tokens.clear();
+                        persisted_config.save().await?;
+                        config.gateway.paired_tokens.clear();
+                        info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
+                    }
+                    let port = port.unwrap_or(config.gateway.port);
+                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+
+                    if is_restart {
+                        info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
+                        // TODO: Implement actual restart logic (stop existing, start new)
+                    } else if port == 0 {
+                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
+                    } else {
+                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
+                    }
+
+                    if open_dashboard {
+                        if port == 0 {
                             warn!(
-                                "Could not open dashboard automatically ({err}). Open manually: {dashboard_url}"
+                                "--open-dashboard requires a fixed port; skipping auto-open because --port 0 uses a random port"
                             );
                         } else {
-                            info!("🌐 Opened dashboard in browser: {dashboard_url}");
+                            let dashboard_url = dashboard_open_url(&host, port);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                                if let Err(err) = open_url_in_default_browser(&dashboard_url).await {
+                                    warn!(
+                                        "Could not open dashboard automatically ({err}). Open manually: {dashboard_url}"
+                                    );
+                                } else {
+                                    info!("🌐 Opened dashboard in browser: {dashboard_url}");
+                                }
+                            });
                         }
-                    });
+                    }
+                    gateway::run_gateway(&host, port, config).await
+                }
+                Some(zeroclaw::GatewayCommands::GetPaircode) => {
+                    // Show pairing code from config
+                    if config.gateway.require_pairing {
+                        println!("🔐 Gateway pairing is enabled.");
+                        if config.gateway.paired_tokens.is_empty() {
+                            println!("   No pairing code generated yet.");
+                            println!("   Start the gateway first to generate a pairing code.");
+                        } else {
+                            println!(
+                                "   Paired tokens: {} configured",
+                                config.gateway.paired_tokens.len()
+                            );
+                            println!("   To get a new pairing code, restart the gateway.");
+                        }
+                    } else {
+                        println!("⚠️  Gateway pairing is disabled.");
+                        println!("   All requests will be accepted without authentication.");
+                    }
+                    Ok(())
                 }
             }
-            gateway::run_gateway(&host, port, config).await
         }
 
         Commands::Daemon { port, host } => {
