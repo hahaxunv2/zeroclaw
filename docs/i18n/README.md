@@ -17,7 +17,7 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
 
 ## Structure
 
-- Docs structure map (language/part/function): [../structure/README.md](../structure/README.md)
+- Docs structure map (language/part/function): [../maintainers/structure-README.md](../maintainers/structure-README.md)
 - Canonical locale trees:
   - `docs/i18n/zh-CN/`
   - `docs/i18n/ja/`
@@ -27,6 +27,6 @@ Narrative depth status: **enhanced bridge rollout completed for `zh-CN`/`ja`/`ru
   - `docs/i18n/el/`
 - Docs-root compatibility shims are limited to paths like `docs/SUMMARY.<locale>.md` when retained.
 
-See overall coverage and conventions in [../i18n-coverage.md](../i18n-coverage.md).
-See remaining localization depth gaps in [../i18n-gap-backlog.md](../i18n-gap-backlog.md).
-For required execution steps, use [../i18n-guide.md](../i18n-guide.md).
+See overall coverage and conventions in [../maintainers/i18n-coverage.md](../maintainers/i18n-coverage.md).
+See remaining localization depth gaps in [i18n-gap-backlog.md](i18n-gap-backlog.md).
+For required execution steps, use [i18n-guide.md](i18n-guide.md).

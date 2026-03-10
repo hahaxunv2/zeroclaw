@@ -350,6 +350,6 @@ zeroclaw channel doctor
 ## 📚 Additional Resources
 
 - [Telegram Bot API Documentation](https://core.telegram.org/bots/api)
-- [ZeroClaw Main README](README.md)
-- [Contributing Guide](CONTRIBUTING.md)
+- [ZeroClaw Main README](../../README.md)
+- [Contributing Guide](../../CONTRIBUTING.md)
 - [Issue Tracker](https://github.com/zeroclaw-labs/zeroclaw/issues)

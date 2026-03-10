@@ -14,8 +14,7 @@ Repository convention:
 
 Workflow behavior documentation in this directory:
 
-<<<<<<< HEAD
-- `.github/workflows/main-branch-flow.md`
+- `.github/workflows/master-branch-flow.md`
 
 Current workflow helper scripts:
 
@@ -33,6 +32,3 @@ Release/CI policy assets introduced for advanced delivery lanes:
 - `.github/release/nightly-owner-routing.json`
 - `.github/release/canary-policy.json`
 - `.github/release/prerelease-stage-gates.json`
-=======
-- `.github/workflows/master-branch-flow.md`
->>>>>>> fa2faf40 (chore: update .gitignore, CODEOWNERS, and dependabot configuration)

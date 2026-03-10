@@ -35,14 +35,10 @@ Publish-mode guardrails:
 
 - Tag must match stable format `vX.Y.Z` (pre-release tags are handled by `Pub Pre-release`).
 - Tag must already exist on origin.
-<<<<<<< HEAD
 - Tag must be annotated (lightweight tags are rejected).
-- Tag commit must be reachable from `origin/main`.
+- Tag commit must be reachable from `origin/master`.
 - Publish trigger actor must be in `RELEASE_AUTHORIZED_ACTORS` allowlist.
 - Optional tagger-email allowlist can be enforced via `RELEASE_AUTHORIZED_TAGGER_EMAILS`.
-=======
-- Tag commit must be reachable from `origin/master`.
->>>>>>> 31c027ed (fix: replace remaining origin/main and `main` refs in release-process docs)
 - Matching GHCR image tag (`ghcr.io/<owner>/<repo>:<tag>`) must be available before GitHub Release publish completes.
 - Artifacts are verified before publish.
 - Trigger provenance is recorded in `release-trigger-guard.json` and `audit-event-release-trigger-guard.json`.

@@ -301,5 +301,5 @@ If all tests pass:
 ## 📞 Support
 
 - Issues: https://github.com/zeroclaw-labs/zeroclaw/issues
-- Docs: `docs/contributing/testing-telegram.md`
+- Docs: [testing-telegram.md](../../tests/telegram/testing-telegram.md)
 - Help: `zeroclaw --help`
