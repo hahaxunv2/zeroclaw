@@ -10,7 +10,7 @@ ZeroClaw bao gồm mọi thứ cần thiết cho Arduino Uno Q. **Clone repo và
 
 | Thành phần | Vị trí | Mục đích |
 |------------|--------|---------|
-| Bridge app | `firmware/zeroclaw-uno-q-bridge/` | MCU sketch + Python socket server (port 9999) cho GPIO |
+| Bridge app | `firmware/uno-q-bridge/` | MCU sketch + Python socket server (port 9999) cho GPIO |
 | Bridge tools | `src/peripherals/uno_q_bridge.rs` | Tool `gpio_read` / `gpio_write` giao tiếp với Bridge qua TCP |
 | Setup command | `src/peripherals/uno_q_setup.rs` | `zeroclaw peripheral setup-uno-q` triển khai Bridge qua scp + arduino-app-cli |
 | Config schema | `board = "arduino-uno-q"`, `transport = "bridge"` | Được hỗ trợ trong `config.toml` |
@@ -168,7 +168,7 @@ zeroclaw peripheral setup-uno-q --host 192.168.0.48
 zeroclaw peripheral setup-uno-q
 ```
 
-Lệnh này copy Bridge app vào `~/ArduinoApps/zeroclaw-uno-q-bridge` và khởi động nó.
+Lệnh này copy Bridge app vào `~/ArduinoApps/uno-q-bridge` và khởi động nó.
 
 ### 5.2 Thêm vào config.toml
 

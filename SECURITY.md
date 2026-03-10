@@ -12,7 +12,8 @@ Please do not open public GitHub issues for unpatched security vulnerabilities.
 
 ZeroClaw uses GitHub's private vulnerability reporting and advisory workflow for important security issues.
 
-Preferred reporting paths:
+1. **Email**: Send details to the maintainers via GitHub private vulnerability reporting.
+2. **GitHub**: Use [GitHub Security Advisories](https://github.com/zeroclaw-labs/zeroclaw/security/advisories/new).
 
 1. If you are a researcher or user:
    - Go to `Security` -> `Report a vulnerability`.

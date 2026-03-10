@@ -434,10 +434,6 @@ impl Provider for OpenRouterProvider {
             .send()
             .await?;
 
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
         let chat_response: ApiChatResponse = response.json().await?;
 
         chat_response
@@ -481,14 +477,7 @@ impl Provider for OpenRouterProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenRouter", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
         let choice = native_response
             .choices
             .into_iter()
@@ -579,14 +568,7 @@ impl Provider for OpenRouterProvider {
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
-        });
-        let choice = native_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenRouter"))?;
-        let mut result = Self::parse_native_response(choice);
-        result.usage = usage;
+            .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
         Ok(result)
     }
 }
