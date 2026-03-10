@@ -45,3 +45,5 @@ credentials.json
 
 # Nix
 result
+# Coverage artifacts
+lcov.info
