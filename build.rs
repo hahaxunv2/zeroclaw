@@ -77,4 +77,11 @@ fn main() {
         "cargo:rustc-env=ZEROCLAW_GIT_SHORT_SHA={}",
         short_sha.unwrap_or_default()
     );
+
+    // Ensure web/dist exists
+    let dir = std::path::Path::new("web/dist");
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+}
 }
