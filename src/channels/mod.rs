@@ -5868,9 +5868,33 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    let tools_registry = Arc::new(built_tools);
-
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
+
+    // Register skill tools into built_tools
+    for skill in &skills {
+        tracing::info!("Skill '{}' has {} tool(s)", skill.name, skill.tools.len());
+        for tool_def in &skill.tools {
+            match crate::skills::SkillToolHandler::new(
+                skill.name.clone(),
+                tool_def.clone(),
+                Arc::clone(&security),
+                skill.location.clone(),
+            ) {
+                Ok(handler) => {
+                    built_tools.push(Box::new(handler));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to register tool '{}' from skill '{}': {e}",
+                        tool_def.name,
+                        skill.name
+                    );
+                }
+            }
+        }
+    }
+
+    let tools_registry = Arc::new(built_tools);
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![

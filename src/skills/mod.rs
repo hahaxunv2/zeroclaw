@@ -111,7 +111,10 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
         Some(&config.skills.trusted_skill_roots),
-        SkillLoadMode::from_prompt_mode(config.skills.prompt_injection_mode),
+        // We ALWAYS use Full load mode here so that tools are available for registration.
+        // The system prompt builder will handle whether to inject full or compact descriptions
+        // into the AI's context using the mode from config.
+        SkillLoadMode::Full,
     )
 }
 
@@ -145,7 +148,12 @@ fn load_skills_with_open_skills_config(
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
-        skills.extend(load_open_skills(&open_skills_dir, allow_scripts, load_mode));
+        skills.extend(load_open_skills(
+            &open_skills_dir,
+            allow_scripts,
+            &trusted_skill_roots,
+            load_mode,
+        ));
     }
 
     skills.extend(load_workspace_skills(
@@ -333,13 +341,23 @@ fn load_skills_from_directory(
     skills
 }
 
-fn load_open_skills(repo_dir: &Path, allow_scripts: bool, load_mode: SkillLoadMode) -> Vec<Skill> {
+fn load_open_skills(
+    repo_dir: &Path,
+    allow_scripts: bool,
+    trusted_skill_roots: &[PathBuf],
+    load_mode: SkillLoadMode,
+) -> Vec<Skill> {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
     let nested_skills_dir = repo_dir.join("skills");
     if nested_skills_dir.is_dir() {
-        return load_skills_from_directory(&nested_skills_dir, allow_scripts, &[], load_mode);
+        return load_skills_from_directory(
+            &nested_skills_dir,
+            allow_scripts,
+            trusted_skill_roots,
+            load_mode,
+        );
     }
 
     let mut skills = Vec::new();
@@ -933,7 +951,12 @@ pub fn create_skill_tools(
 
     for skill in skills {
         for tool_def in &skill.tools {
-            match SkillToolHandler::new(skill.name.clone(), tool_def.clone(), security.clone()) {
+            match SkillToolHandler::new(
+                skill.name.clone(),
+                tool_def.clone(),
+                security.clone(),
+                skill.location.clone(),
+            ) {
                 Ok(handler) => {
                     tracing::debug!(
                         skill = %skill.name,

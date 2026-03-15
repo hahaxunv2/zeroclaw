@@ -70,6 +70,7 @@ pub struct SkillToolHandler {
     tool_def: SkillTool,
     parameters: Vec<SkillToolParameter>,
     security: Arc<SecurityPolicy>,
+    location: Option<std::path::PathBuf>,
 }
 
 impl SkillToolHandler {
@@ -78,6 +79,7 @@ impl SkillToolHandler {
         skill_name: String,
         tool_def: SkillTool,
         security: Arc<SecurityPolicy>,
+        location: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         if !tool_def.kind.eq_ignore_ascii_case("shell") {
             tracing::warn!(
@@ -97,6 +99,7 @@ impl SkillToolHandler {
             tool_def,
             parameters,
             security,
+            location,
         })
     }
 
@@ -387,9 +390,16 @@ impl Tool for SkillToolHandler {
             "Executing skill tool"
         );
 
-        let output = tokio::process::Command::new("sh")
-            .arg("-c")
-            .arg(&command)
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(&command);
+
+        if let Some(loc) = &self.location {
+            if let Some(parent) = loc.parent() {
+                cmd.current_dir(parent);
+            }
+        }
+
+        let output = cmd
             .output()
             .await
             .context("Failed to execute skill tool command")?;
@@ -485,7 +495,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test-skill".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test-skill".to_string(), tool_def, security, None).unwrap();
         let schema = handler.generate_schema();
 
         assert_eq!(schema["type"], "object");
@@ -512,7 +522,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, None).unwrap();
 
         let args = serde_json::json!({
             "limit": 100,
@@ -543,7 +553,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, None).unwrap();
 
         let args = serde_json::json!({
             "required": "value"
@@ -569,7 +579,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, None).unwrap();
 
         let args = serde_json::json!({
             "message": "hello; rm -rf /"
@@ -603,7 +613,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, None).unwrap();
 
         // Only provide contact_name and limit, omit query and date_from
         let args = serde_json::json!({
@@ -642,7 +652,7 @@ mod tests {
         };
 
         let security = Arc::new(SecurityPolicy::default());
-        let handler = SkillToolHandler::new("test".to_string(), tool_def, security).unwrap();
+        let handler = SkillToolHandler::new("test".to_string(), tool_def, security, None).unwrap();
 
         // Model sends contact_name as integer (use i64 for large Telegram IDs)
         let args = serde_json::json!({

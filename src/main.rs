@@ -1106,7 +1106,6 @@ async fn main() -> Result<()> {
             // so tools are not denied by a stdin read returning EOF.
             let interactive = message.is_none();
             let final_temperature = temperature.unwrap_or(config.default_temperature);
-            let final_temperature = temperature.unwrap_or(config.default_temperature);
 
             agent::run(
                 config,
@@ -1124,78 +1123,6 @@ async fn main() -> Result<()> {
 
         Commands::Gateway { gateway_command } => {
             match gateway_command {
-                Some(zeroclaw::GatewayCommands::Start {
-                    port,
-                    host,
-                    new_pairing,
-                    open_dashboard,
-                })
-                | Some(zeroclaw::GatewayCommands::Restart {
-                    port,
-                    host,
-                    new_pairing,
-                    open_dashboard,
-                })
-                | None => {
-                    let is_restart = matches!(
-                        gateway_command,
-                        Some(zeroclaw::GatewayCommands::Restart { .. })
-                    );
-                    if new_pairing {
-                        // Persist token reset from raw config so env-derived overrides are not written to disk.
-                        let mut persisted_config = Config::load_or_init().await?;
-                        persisted_config.gateway.paired_tokens.clear();
-                        persisted_config.save().await?;
-                        config.gateway.paired_tokens.clear();
-                        info!("🔐 Cleared paired tokens — a fresh pairing code will be generated");
-                    }
-                    let port = port.unwrap_or(config.gateway.port);
-                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
-                    if is_restart {
-                        info!("🔄 Restarting ZeroClaw Gateway on {host}:{port}");
-
-                        // Try to connect to existing gateway and shut it down gracefully
-                        let addr = format!("{host}:{port}");
-                        match tokio::net::TcpStream::connect(&addr).await {
-                            Ok(_) => {
-                                info!("   Found existing gateway on {addr}, attempting graceful shutdown...");
-                                // Wait a moment for the connection to be established
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                            }
-                            Err(_) => {
-                                info!("   No existing gateway found on {addr}");
-                            }
-                        }
-
-                        // Small delay to allow any cleanup
-                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    } else if port == 0 {
-                        info!("🚀 Starting ZeroClaw Gateway on {host} (random port)");
-                    } else {
-                        info!("🚀 Starting ZeroClaw Gateway on {host}:{port}");
-                    }
-
-                    if open_dashboard {
-                        if port == 0 {
-                            warn!(
-                                "--open-dashboard requires a fixed port; skipping auto-open because --port 0 uses a random port"
-                            );
-                        } else {
-                            let dashboard_url = dashboard_open_url(&host, port);
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-                                if let Err(err) = open_url_in_default_browser(&dashboard_url).await {
-                                    warn!(
-                                        "Could not open dashboard automatically ({err}). Open manually: {dashboard_url}"
-                                    );
-                                } else {
-                                    info!("🌐 Opened dashboard in browser: {dashboard_url}");
-                                }
-                            });
-                        }
-                    }
-                    gateway::run_gateway(&host, port, config).await
-                }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
@@ -1240,24 +1167,12 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                Some(zeroclaw::GatewayCommands::Start {
-                    port,
-                    host,
-                    new_pairing,
-                    open_dashboard,
-                })
-                | Some(zeroclaw::GatewayCommands::Restart {
-                    port,
-                    host,
-                    new_pairing,
-                    open_dashboard,
-                })
-                | None => {
+                cmd => {
                     let is_restart = matches!(
-                        gateway_command,
+                        cmd,
                         Some(zeroclaw::GatewayCommands::Restart { .. })
                     );
-                    let (port, host, new_pairing, open_dashboard) = match gateway_command {
+                    let (port_opt, host_opt, new_pairing, open_dashboard) = match cmd {
                         Some(zeroclaw::GatewayCommands::Start {
                             port,
                             host,
@@ -1269,15 +1184,12 @@ async fn main() -> Result<()> {
                             host,
                             new_pairing,
                             open_dashboard,
-                        }) => {
-                            let (p, h) = resolve_gateway_addr(&config, port.clone(), host.clone());
-                            (Some(p), Some(h), *new_pairing, *open_dashboard)
-                        }
+                        }) => (port.clone(), host.clone(), new_pairing, open_dashboard),
                         _ => (None, None, false, false),
                     };
 
-                    let port = port.unwrap_or(config.gateway.port);
-                    let host = host.unwrap_or_else(|| config.gateway.host.clone());
+                    let port: u16 = port_opt.unwrap_or(config.gateway.port);
+                    let host: String = host_opt.unwrap_or_else(|| config.gateway.host.clone());
 
                     if new_pairing {
                         // Persist token reset from raw config so env-derived overrides are not written to disk.

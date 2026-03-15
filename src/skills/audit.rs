@@ -101,7 +101,12 @@ pub fn audit_open_skill_markdown(path: &Path, repo_root: &Path) -> Result<SkillA
         files_scanned: 1,
         findings: Vec::new(),
     };
-    audit_markdown_file(&canonical_repo, &canonical_path, &mut report)?;
+    audit_markdown_file(
+        &canonical_repo,
+        &canonical_path,
+        &SkillAuditOptions::default(),
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -289,7 +294,7 @@ fn audit_path(
         .with_context(|| format!("failed to read metadata for {}", path.display()))?;
     let rel = relative_display(root, path);
 
-    if metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() && !options.allow_scripts {
         report.findings.push(format!(
             "{rel}: symlinks are not allowed in installed skills."
         ));
@@ -314,7 +319,7 @@ fn audit_path(
     }
 
     if is_markdown_file(path) {
-        audit_markdown_file(root, path, report)?;
+        audit_markdown_file(root, path, &options, report)?;
     } else if is_toml_file(path) {
         audit_manifest_file(root, path, report)?;
     }
@@ -322,19 +327,26 @@ fn audit_path(
     Ok(())
 }
 
-fn audit_markdown_file(root: &Path, path: &Path, report: &mut SkillAuditReport) -> Result<()> {
+fn audit_markdown_file(
+    root: &Path,
+    path: &Path,
+    options: &SkillAuditOptions,
+    report: &mut SkillAuditReport,
+) -> Result<()> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read markdown file {}", path.display()))?;
     let rel = relative_display(root, path);
 
     if let Some(pattern) = detect_high_risk_snippet(&content) {
-        report.findings.push(format!(
-            "{rel}: detected high-risk command pattern ({pattern})."
-        ));
+        if !options.allow_scripts {
+            report.findings.push(format!(
+                "{rel}: detected high-risk command pattern ({pattern})."
+            ));
+        }
     }
 
     for raw_target in extract_markdown_links(&content) {
-        audit_markdown_link_target(root, path, &raw_target, report);
+        audit_markdown_link_target(root, path, &raw_target, options, report);
     }
 
     Ok(())
@@ -408,6 +420,7 @@ fn audit_markdown_link_target(
     root: &Path,
     source: &Path,
     raw: &str,
+    options: &SkillAuditOptions,
     report: &mut SkillAuditReport,
 ) {
     let normalized = normalize_markdown_target(raw);
@@ -419,7 +432,7 @@ fn audit_markdown_link_target(
 
     if let Some(scheme) = url_scheme(normalized) {
         if matches!(scheme, "http" | "https" | "mailto") {
-            if has_markdown_suffix(normalized) {
+            if has_markdown_suffix(normalized) && !options.allow_scripts {
                 report.findings.push(format!(
                     "{rel}: remote markdown links are blocked by skill security audit ({normalized})."
                 ));
@@ -438,7 +451,7 @@ fn audit_markdown_link_target(
         return;
     }
 
-    if looks_like_absolute_path(stripped) {
+    if looks_like_absolute_path(stripped) && !options.allow_scripts {
         report.findings.push(format!(
             "{rel}: absolute markdown link paths are not allowed ({normalized})."
         ));
@@ -496,9 +509,11 @@ fn audit_markdown_link_target(
                 ));
                 return;
             }
-            report.findings.push(format!(
-                "{rel}: markdown link points to a missing file ({normalized})."
-            ));
+            if !options.allow_scripts {
+                report.findings.push(format!(
+                    "{rel}: markdown link points to a missing file ({normalized})."
+                ));
+            }
         }
     }
 }

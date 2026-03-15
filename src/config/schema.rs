@@ -836,6 +836,9 @@ impl Default for TtsConfig {
             elevenlabs: None,
             google: None,
             edge: None,
+        }
+    }
+}
 
 // ── MCP ─────────────────────────────────────────────────────────
 
@@ -6765,6 +6768,10 @@ impl Default for Config {
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
+            model_support_vision: None,
+            wasm: WasmConfig::default(),
         }
     }
 }
@@ -10754,6 +10761,10 @@ ws_url = "ws://127.0.0.1:3002"
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
+            model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -11139,6 +11150,10 @@ denied_tools = ["shell"]
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
+            agents_ipc: AgentsIpcConfig::default(),
+            mcp: McpConfig::default(),
+            model_support_vision: None,
+            wasm: WasmConfig::default(),
         };
 
         config.save().await.unwrap();
